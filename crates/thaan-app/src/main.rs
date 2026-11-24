@@ -2,6 +2,7 @@
 
 mod app;
 mod grid;
+mod logo;
 mod theme;
 
 use gpui_kit::component::ThemeMode;

@@ -1796,7 +1796,11 @@ impl Render for ThaanApp {
                         )
                     })
             }
-            None => h_flex().child(div().font_medium().child("ThaanDB")),
+            None => h_flex()
+                .gap_2()
+                .items_center()
+                .child(crate::logo::mark(theme.primary, theme.foreground))
+                .child(div().font_medium().child("ThaanDB")),
         };
         let mod_key = if cfg!(target_os = "macos") {
             "⌘"

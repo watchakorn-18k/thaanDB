@@ -22,10 +22,14 @@
   invoke the `unslop` skill first and follow it, then make the change. This applies
   every time, including small tweaks. Keep `docs/spec/ui.md` in sync with what it decides.
 - When you finish a feature, update its status in `docs/spec/features.md`.
-- Seeing the GUI on macOS: the screenshot tools only find bundled apps. Wrap the binary in
-  `target/ThaanDB.app` (`Contents/MacOS/thaan-app` + an `Info.plist` with bundle id
-  `dev.thaandb.app`). After a rebuild, `rm` the old binary before copying (overwriting it in
-  place gets the process killed), do not `codesign` the bundle (the window then stops
-  being visible to the tools), and launch with
+- Seeing the GUI on macOS: the screenshot tools only find bundled apps. Run
+  `scripts/bundle-macos.sh` (add `--release` for a release build): it builds `thaan-app` with cargo
+  (blaze cannot build its mongodb dependency yet) and
+  writes `target/ThaanDB.app` with bundle id `dev.thaandb.app` and the app icon from
+  `crates/thaan-app/assets/macos/AppIcon.icns`. It removes the old binary before copying
+  (overwriting it in place gets the process killed). Do not `codesign` the bundle (the window
+  then stops being visible to the tools). Launch with
   `THAAN_HOME=target/thaan-home nohup target/ThaanDB.app/Contents/MacOS/thaan-app &`.
+- The app icon and the title-bar mark come from `docs/brand` (see its README). Regenerate
+  `AppIcon.icns` from `docs/brand/logo/thaandb-macos-icon*.svg` with `iconutil` if the logo changes.
 - Use `THAAN_HOME=target/thaan-home` for manual testing so the user's real store is untouched.
