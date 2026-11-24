@@ -78,17 +78,29 @@ fn conn_target(c: &ConnectionConfig) -> String {
 }
 
 impl ThaanApp {
+    /// Opens the New connection dialog in the kit's dialog layer. The builder reads this
+    /// view's state on every frame, so step changes and typing show up without reopening.
     pub(super) fn open_conn_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home.dialog = Some(ConnDialog::Pick);
         self.home.driver_search.update(cx, |s, cx| {
             s.set_value("", window, cx);
             s.focus(window, cx);
         });
-        cx.notify();
-    }
-
-    fn close_conn_dialog(&mut self, cx: &mut Context<Self>) {
-        self.home.dialog = None;
+        let this = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let parts = this.update(cx, |app, cx| app.conn_dialog_parts(cx));
+            let this = this.clone();
+            let dialog = dialog.w(px(760.)).on_close(move |_, _, cx| {
+                this.update(cx, |app, cx| {
+                    app.home.dialog = None;
+                    cx.notify();
+                });
+            });
+            match parts {
+                Some((title, body, footer)) => dialog.title(title).child(body).footer(footer),
+                None => dialog,
+            }
+        });
         cx.notify();
     }
 
@@ -108,96 +120,97 @@ impl ThaanApp {
             .enumerate()
             .filter(|(_, c)| q.is_empty() || c.name.to_lowercase().contains(&q))
             .collect();
-        let sidebar = v_flex()
-            .w(px(280.))
-            .flex_none()
-            .h_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .px_2()
-                    .pt_2()
-                    .pb_1()
-                    .gap_1()
-                    .child(div().flex_1().child(Input::new(&self.home.filter).small()))
-                    .child(
-                        Button::new("home-new")
-                            .ghost()
-                            .xsmall()
-                            .icon(icon("plus"))
-                            .tooltip("New connection")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_conn_dialog(window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                group_label("Connections", Some(saved.len()), &theme)
-                    .px_4()
-                    .pt_1()
-                    .pb_1(),
-            )
-            .child(
-                v_flex()
-                    .id("home-conns")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .pb_2()
-                    .gap_0p5()
-                    .when(saved.is_empty(), |d| {
-                        d.child(
-                            div()
+        let sidebar =
+            v_flex()
+                .w(px(280.))
+                .flex_none()
+                .h_full()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(theme.sidebar_border)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .gap_1()
+                        .child(div().flex_1().child(Input::new(&self.home.filter).small()))
+                        .child(
+                            Button::new("home-new")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon("plus"))
+                                .tooltip("New connection")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_conn_dialog(window, cx)
+                                })),
+                        ),
+                )
+                .child(
+                    group_label("Connections", Some(saved.len()), &theme)
+                        .px_4()
+                        .pt_1()
+                        .pb_1(),
+                )
+                .child(
+                    v_flex()
+                        .id("home-conns")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .px_2()
+                        .pb_2()
+                        .gap_0p5()
+                        .when(saved.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px_2()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("No saved connections yet"),
+                            )
+                        })
+                        .children(shown.into_iter().map(|(i, c)| {
+                            let color = c
+                                .color
+                                .as_deref()
+                                .and_then(parse_hex)
+                                .unwrap_or(theme.primary);
+                            let id = c.id.clone();
+                            h_flex()
+                                .id(("home-conn", i))
+                                .flex_none()
+                                .h(px(ROW_H + 4.))
+                                .gap_2()
                                 .px_2()
+                                .rounded(px(6.))
                                 .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("No saved connections yet"),
-                        )
-                    })
-                    .children(shown.into_iter().map(|(i, c)| {
-                        let color = c
-                            .color
-                            .as_deref()
-                            .and_then(parse_hex)
-                            .unwrap_or(theme.primary);
-                        let id = c.id.clone();
-                        h_flex()
-                            .id(("home-conn", i))
-                            .flex_none()
-                            .h(px(ROW_H + 4.))
-                            .gap_2()
-                            .px_2()
-                            .rounded(px(6.))
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.sidebar_accent))
-                            .child(
-                                icon(driver_icon(&c.driver))
-                                    .size_4()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .child(div().flex_1().truncate().child(c.name.clone()))
-                            .child(conn_dot(color))
-                            .child(
-                                Button::new(("home-del", i))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(icon("trash"))
-                                    .tooltip("Delete connection")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.engine.delete_connection(&id).ok();
-                                        this.connections = this.engine.connections();
-                                        cx.notify();
-                                    })),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.connect(c.clone(), window, cx)
-                            }))
-                    })),
-            );
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.sidebar_accent))
+                                .child(
+                                    icon(driver_icon(&c.driver))
+                                        .size_4()
+                                        .text_color(theme.muted_foreground),
+                                )
+                                .child(div().flex_1().truncate().child(c.name.clone()))
+                                .child(conn_dot(color))
+                                .child(
+                                    Button::new(("home-del", i))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(icon("trash"))
+                                        .tooltip("Delete connection")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.engine.delete_connection(&id).ok();
+                                            this.connections = this.engine.connections();
+                                            cx.notify();
+                                        })),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.connect(c.clone(), window, cx)
+                                }))
+                        })),
+                );
 
         // ---- overview ----
         let card = || {
@@ -247,97 +260,93 @@ impl ThaanApp {
             .child(stat("Saved queries", saved_queries, "bookmark"))
             .child(stat("Queries run", history.len(), "clock"));
 
-        let quick = card()
-            .flex_1()
-            .min_w_0()
-            .child(card_head("Quick connect", "plug"))
-            .when(saved.is_empty(), |d| {
-                d.child(
-                    v_flex()
-                        .p_5()
-                        .gap_3()
-                        .items_start()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("Add a connection to see it here")
-                        .child(
-                            Button::new("quick-new")
-                                .primary()
-                                .small()
-                                .icon(icon("plus"))
-                                .label("New connection")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_conn_dialog(window, cx)
-                                })),
-                        ),
-                )
-            })
-            .children(saved.iter().take(5).enumerate().map(|(i, c)| {
-                let c2 = c.clone();
-                let color = c
-                    .color
-                    .as_deref()
-                    .and_then(parse_hex)
-                    .unwrap_or(theme.primary);
-                let driver_name = self
-                    .drivers
-                    .iter()
-                    .find(|d| d.id == c.driver)
-                    .map(|d| d.name.clone())
-                    .unwrap_or_else(|| c.driver.clone());
-                h_flex()
-                    .id(("quick", i))
-                    .px_5()
-                    .py_3()
-                    .gap_3()
-                    .when(i > 0, |d| d.border_t_1().border_color(theme.border))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .child(
-                        icon(driver_icon(&c.driver))
-                            .size_4()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
+        let quick =
+            card()
+                .flex_1()
+                .min_w_0()
+                .child(card_head("Quick connect", "plug"))
+                .when(saved.is_empty(), |d| {
+                    d.child(
                         v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_0p5()
+                            .p_5()
+                            .gap_3()
+                            .items_start()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Add a connection to see it here")
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(div().text_sm().font_medium().child(c.name.clone()))
-                                    .child(conn_dot(color)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .truncate()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{driver_name} · {}", conn_target(c))),
+                                Button::new("quick-new")
+                                    .primary()
+                                    .small()
+                                    .icon(icon("plus"))
+                                    .label("New connection")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_conn_dialog(window, cx)
+                                    })),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Connect"),
-                    )
-                    .child(
-                        icon("chevron-right")
-                            .size_4()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.connect(c2.clone(), window, cx)
-                    }))
-            }));
+                })
+                .children(saved.iter().take(5).enumerate().map(|(i, c)| {
+                    let c2 = c.clone();
+                    let color = c
+                        .color
+                        .as_deref()
+                        .and_then(parse_hex)
+                        .unwrap_or(theme.primary);
+                    let driver_name = self
+                        .drivers
+                        .iter()
+                        .find(|d| d.id == c.driver)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| c.driver.clone());
+                    h_flex()
+                        .id(("quick", i))
+                        .px_5()
+                        .py_3()
+                        .gap_3()
+                        .when(i > 0, |d| d.border_t_1().border_color(theme.border))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.list_hover))
+                        .child(
+                            icon(driver_icon(&c.driver))
+                                .size_4()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().text_sm().font_medium().child(c.name.clone()))
+                                        .child(conn_dot(color)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .truncate()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{driver_name} · {}", conn_target(c))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Connect"),
+                        )
+                        .child(
+                            icon("chevron-right")
+                                .size_4()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.connect(c2.clone(), window, cx)
+                        }))
+                }));
 
-        let mod_key = if cfg!(target_os = "macos") {
-            "⌘"
-        } else {
-            "Ctrl"
-        };
         let shortcut = |id: &'static str, ic: &'static str, label: &'static str| {
             h_flex()
                 .id(id)
@@ -364,8 +373,7 @@ impl ThaanApp {
                     ))
                     .child(
                         shortcut("sc-palette", "command", "Command palette")
-                            .child(keycap(mod_key, &theme))
-                            .child(keycap("K", &theme))
+                            .children(kbd(PALETTE_KEY))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_palette(window, cx)
                             })),
@@ -388,60 +396,57 @@ impl ThaanApp {
                     .child("Click a connection to open it. Its tables and views appear in the sidebar."),
             );
 
-        let recent = card()
-            .child(card_head("Recent queries", "clock"))
-            .when(history.is_empty(), |d| {
-                d.child(
-                    div()
-                        .p_5()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("Queries you run appear here"),
-                )
-            })
-            .children(history.iter().take(5).enumerate().map(|(i, h)| {
-                h_flex()
-                    .px_5()
-                    .h(px(40.))
-                    .gap_3()
-                    .when(i > 0, |d| d.border_t_1().border_color(theme.border))
-                    .child(
+        let recent =
+            card()
+                .child(card_head("Recent queries", "clock"))
+                .when(history.is_empty(), |d| {
+                    d.child(
                         div()
-                            .size(px(6.))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(if h.error.is_some() {
+                            .p_5()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Queries you run appear here"),
+                    )
+                })
+                .children(history.iter().take(5).enumerate().map(|(i, h)| {
+                    h_flex()
+                        .px_5()
+                        .h(px(40.))
+                        .gap_3()
+                        .when(i > 0, |d| d.border_t_1().border_color(theme.border))
+                        .child(div().size(px(6.)).flex_none().rounded_full().bg(
+                            if h.error.is_some() {
                                 theme.danger
                             } else {
                                 theme.muted_foreground.opacity(0.5)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_family(mono.clone())
-                            .child(first_line(&h.sql)),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .font_family(mono.clone())
-                            .text_color(theme.muted_foreground)
-                            .child(if h.error.is_some() {
-                                "Failed".to_string()
-                            } else {
-                                format!(
-                                    "{} · {} ms",
-                                    plural(h.rows.unwrap_or(0), "row"),
-                                    h.elapsed_ms
-                                )
-                            }),
-                    )
-            }));
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_family(mono.clone())
+                                .child(first_line(&h.sql)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .font_family(mono.clone())
+                                .text_color(theme.muted_foreground)
+                                .child(if h.error.is_some() {
+                                    "Failed".to_string()
+                                } else {
+                                    format!(
+                                        "{} · {} ms",
+                                        plural(h.rows.unwrap_or(0), "row"),
+                                        h.elapsed_ms
+                                    )
+                                }),
+                        )
+                }));
 
         let headless = card()
             .child(card_head("From the terminal", "terminal"))
@@ -499,8 +504,11 @@ impl ThaanApp {
             .into_any_element()
     }
 
-    /// The New connection dialog, drawn over the window.
-    pub(super) fn render_conn_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Title, body and footer of the New connection dialog for its current step.
+    fn conn_dialog_parts(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyElement, AnyElement, AnyElement)> {
         let step = self.home.dialog?;
         let theme = cx.theme().clone();
 
@@ -509,11 +517,7 @@ impl ThaanApp {
             ConnDialog::Form => format!("New {} connection", self.driver.name),
         };
         let header = h_flex()
-            .h(px(56.))
-            .px_6()
-            .gap_3()
-            .border_b_1()
-            .border_color(theme.border)
+            .gap_2()
             .when(step == ConnDialog::Form, |d| {
                 d.child(
                     Button::new("dlg-back")
@@ -527,15 +531,7 @@ impl ThaanApp {
                         })),
                 )
             })
-            .child(div().flex_1().text_base().font_medium().child(title))
-            .child(
-                Button::new("dlg-close")
-                    .ghost()
-                    .xsmall()
-                    .icon(icon("x"))
-                    .tooltip("Close")
-                    .on_click(cx.listener(|this, _, _, cx| this.close_conn_dialog(cx))),
-            );
+            .child(title);
 
         let body: AnyElement = match step {
             ConnDialog::Pick => self.render_driver_grid(cx),
@@ -543,11 +539,8 @@ impl ThaanApp {
         };
 
         let footer = h_flex()
-            .h(px(64.))
-            .px_6()
+            .w_full()
             .gap_2()
-            .border_t_1()
-            .border_color(theme.border)
             .child(
                 h_flex()
                     .flex_1()
@@ -576,7 +569,7 @@ impl ThaanApp {
                         .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
                 )
                 .child(Button::new("save").label("Save").on_click(cx.listener(
-                    |this, _, _, cx| {
+                    |this, _, window, cx| {
                         match this
                             .form_config(cx)
                             .map_err(|e| e.to_string())
@@ -584,7 +577,7 @@ impl ThaanApp {
                         {
                             Ok(c) => {
                                 this.connections = this.engine.connections();
-                                this.home.dialog = None;
+                                window.close_dialog(cx);
                                 this.set_status(format!("Saved “{}”", c.name), false, cx);
                             }
                             Err(e) => this.set_status(e, true, cx),
@@ -600,44 +593,23 @@ impl ThaanApp {
                             "Connect"
                         })
                         .disabled(self.connecting)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            match this.form_config(cx) {
+                        .on_click(
+                            cx.listener(|this, _, window, cx| match this.form_config(cx) {
                                 Ok(c) => {
-                                    this.home.dialog = None;
+                                    window.close_dialog(cx);
                                     this.connect(c, window, cx)
                                 }
                                 Err(e) => this.set_status(e, true, cx),
-                            }
-                        })),
+                            }),
+                        ),
                 )
             });
 
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.overlay)
-                .child(
-                    v_flex()
-                        .id("conn-dialog")
-                        .w(px(760.))
-                        .h(px(560.))
-                        .rounded(px(16.))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.popover)
-                        .shadow_lg()
-                        .overflow_hidden()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_conn_dialog(cx)))
-                        .child(header)
-                        .child(div().flex_1().min_h_0().child(body))
-                        .child(footer),
-                )
-                .into_any_element(),
-        )
+        Some((
+            header.into_any_element(),
+            div().h(px(420.)).child(body).into_any_element(),
+            footer.into_any_element(),
+        ))
     }
 
     /// Step one: the database types, grouped by family and filtered by the search box.

@@ -1,8 +1,12 @@
 //! Main window. All work is dispatched to `thaan_core::Engine`; this file only holds view
 //! state and layout (see AGENTS.md, principle 1 and 3).
 
+#[path = "doc_editor.rs"]
+mod doc_editor;
 #[path = "home.rs"]
 mod home;
+
+use doc_editor::DocEdit;
 
 use crate::docview::{view_switch, DocPanel, DocView};
 use crate::grid::ResultGrid;
@@ -11,10 +15,12 @@ use gpui_kit::base::{Disableable as _, Selectable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::table::{ColumnSort, DataTable, TableState};
+use gpui_kit::component::table::{ColumnSort, DataTable, TableEvent, TableState};
 use gpui_kit::component::IndexPath;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{
     h_flex, h_resizable, resizable_panel, v_flex, v_resizable, ActiveTheme as _, Icon, Sizable as _,
 };
@@ -133,6 +139,10 @@ struct TableTab {
     /// MongoDB: projection and sort documents next to the filter document.
     projection: Entity<InputState>,
     sort_doc: Entity<InputState>,
+    /// MongoDB: the view / edit / add panel, if open.
+    doc_edit: Option<DocEdit>,
+    /// MongoDB: the delete confirmation is showing.
+    pending_delete: bool,
     error: Option<String>,
     loading: bool,
 }
@@ -565,6 +575,9 @@ impl ThaanApp {
         .detach();
         // Table tabs sort on the server, so the order covers every page, not just this one.
         let grid = Self::new_grid(window, cx);
+        // Selecting a row enables the document actions (view / edit / delete).
+        cx.subscribe(&grid, |_, _, _: &TableEvent, cx| cx.notify())
+            .detach();
         let weak = cx.entity().downgrade();
         let sort_object = object.clone();
         let table_info = info.clone();
@@ -615,6 +628,8 @@ impl ThaanApp {
             docs,
             projection,
             sort_doc,
+            doc_edit: None,
+            pending_delete: false,
             error: None,
             loading: false,
         })));
@@ -1683,7 +1698,12 @@ impl ThaanApp {
                         .flex_basis(px(0.))
                         .min_w_0()
                         .gap_1p5()
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(label))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
                         .child(div().flex_1().min_w_0().child(Input::new(input).small()))
                 };
                 h_flex()
@@ -1914,7 +1934,22 @@ impl ThaanApp {
             .size_full()
             .child(header)
             .children(filter_bar)
-            .child(div().flex_1().overflow_hidden().child(body))
+            .children(self.render_doc_bar(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(body),
+                    )
+                    .children(self.render_doc_editor(cx)),
+            )
             .into_any_element()
     }
 
@@ -1968,7 +2003,11 @@ impl ThaanApp {
                     )
                 }
             } else {
-                format!("{} · {} ms", plural(p.total_rows, "row"), p.result.elapsed_ms)
+                format!(
+                    "{} · {} ms",
+                    plural(p.total_rows, "row"),
+                    p.result.elapsed_ms
+                )
             };
             if let Some(a) = ago {
                 out.push_str(" · ");
@@ -2160,7 +2199,7 @@ impl ThaanApp {
                                     .text_color(theme.muted_foreground)
                                     .child(c.category),
                             )
-                            .when_some(c.shortcut, |d, s| d.child(keycap(s, &theme)))
+                            .children(c.shortcut.and_then(kbd))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.run_palette_command(id, window, cx)
                             }))
@@ -2227,11 +2266,6 @@ impl Render for ThaanApp {
                 .child(crate::logo::mark(theme.primary, theme.foreground))
                 .child(div().font_medium().child("ThaanDB")),
         };
-        let mod_key = if cfg!(target_os = "macos") {
-            "⌘"
-        } else {
-            "Ctrl"
-        };
         let header = h_flex()
             .h(px(36.))
             .px_3()
@@ -2254,8 +2288,7 @@ impl Render for ThaanApp {
                     .text_color(theme.muted_foreground)
                     .hover(|s| s.bg(theme.list_hover))
                     .child(div().pr_1().child("Commands"))
-                    .child(keycap(mod_key, &theme))
-                    .child(keycap("K", &theme))
+                    .children(kbd(PALETTE_KEY))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
             );
 
@@ -2295,7 +2328,6 @@ impl Render for ThaanApp {
         root.child(header)
             .child(div().flex_1().overflow_hidden().child(main))
             .child(status)
-            .children(self.render_conn_dialog(cx))
             .when(self.palette_open, |d| d.child(self.render_palette(cx)))
     }
 }
@@ -2338,24 +2370,17 @@ fn group_label(title: &str, count: Option<usize>, theme: &ThemeRef) -> Div {
         })
 }
 
-/// A small keyboard key.
-fn keycap(key: &str, theme: &ThemeRef) -> impl IntoElement {
-    div()
-        .min_w(px(18.))
-        .h(px(18.))
-        .px_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.muted.opacity(0.5))
-        .text_xs()
-        .font_family(theme.mono_font_family.clone())
-        .text_color(theme.muted_foreground)
-        .child(key.to_string())
+/// A key binding in GPUI keystroke syntax (`cmd-k`), drawn with the kit's `Kbd`.
+fn kbd(binding: &'static str) -> Option<Kbd> {
+    Keystroke::parse(binding).ok().map(Kbd::new)
 }
+
+/// The command palette binding for this platform.
+const PALETTE_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-k"
+} else {
+    "ctrl-k"
+};
 
 /// The connection's own colour as a dot: the one signature mark, drawn the same everywhere.
 fn conn_dot(color: Hsla) -> impl IntoElement {

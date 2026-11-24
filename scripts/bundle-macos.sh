@@ -2,7 +2,6 @@
 # Build target/ThaanDB.app around the thaan-app binary, with the app icon.
 # Usage: scripts/bundle-macos.sh [--release]
 # The bundle is not code-signed on purpose (see CLAUDE.md).
-# Uses cargo, not blaze: thaan-app pulls in thaan-driver-mongodb, which blaze cannot build yet.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

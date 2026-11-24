@@ -52,6 +52,11 @@ impl ResultGrid {
         self.rs = rs;
     }
 
+    /// Index into `rs.rows` of a displayed row (after any client-side sort).
+    pub fn data_index(&self, row: usize) -> Option<usize> {
+        self.order.get(row).copied()
+    }
+
     /// The typed field behind a cell, for document results.
     fn doc_field(&self, row: usize, col: usize) -> Option<&thaan_core::doc::Doc> {
         let docs = self.rs.documents.as_ref()?;
@@ -287,7 +292,10 @@ impl TableDelegate for ResultGrid {
                 .child((self.row_offset + row_ix as u64 + 1).to_string());
         }
         // Document results: objects and arrays read as `{ n fields }` / `[ n items ]`.
-        if let Some(d) = self.doc_field(row_ix, col_ix - 1).filter(|d| d.is_container()) {
+        if let Some(d) = self
+            .doc_field(row_ix, col_ix - 1)
+            .filter(|d| d.is_container())
+        {
             return div()
                 .font_family(mono)
                 .text_color(crate::docview::kind_color(d.kind(), cx.theme()))

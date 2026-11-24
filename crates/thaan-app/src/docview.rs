@@ -41,6 +41,8 @@ pub struct DocPanel {
     expanded: HashSet<String>,
     json: Entity<EditorState>,
     json_stale: bool,
+    /// Document picked in the tree (index into `docs`), for view / edit / delete.
+    selected: Option<usize>,
 }
 
 struct TreeRow {
@@ -67,6 +69,7 @@ impl DocPanel {
             expanded: HashSet::new(),
             json,
             json_stale: false,
+            selected: None,
         }
     }
 
@@ -82,11 +85,19 @@ impl DocPanel {
     pub fn set_docs(&mut self, docs: Vec<Doc>, cx: &mut Context<Self>) {
         self.docs = docs;
         self.expanded.clear();
+        self.selected = None;
         self.json_stale = true;
         cx.notify();
     }
 
+    /// Document picked in the tree view, if any.
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
     fn toggle(&mut self, path: &str, cx: &mut Context<Self>) {
+        // A click anywhere in a document's rows also selects that document.
+        self.selected = path.split('/').next().and_then(|i| i.parse().ok());
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_string());
         }
@@ -168,6 +179,7 @@ impl DocPanel {
             .child(div().flex_1().child("Value"))
             .child(div().w(px(TYPE_W)).child("Type"));
         let rows = self.rows();
+        let selected = self.selected;
         let list = v_flex()
             .id("doc-tree")
             .flex_1()
@@ -186,6 +198,10 @@ impl DocPanel {
                     .gap_2()
                     .text_sm()
                     .when(i % 2 == 1, |d| d.bg(theme.table_even))
+                    .when(
+                        r.depth == 0 && r.path.parse::<usize>().ok() == selected,
+                        |d| d.bg(theme.table_active),
+                    )
                     .hover(|s| s.bg(theme.table_hover))
                     .when(r.container, |d| d.cursor_pointer())
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(&path, cx)))
