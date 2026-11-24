@@ -1,0 +1,475 @@
+//! SQLite driver, written from the SQLite documentation (sqlite.org/lang.html,
+//! sqlite.org/pragma.html, sqlite.org/schematab.html).
+
+use thaan_core::connection::ConnectionConfig;
+use thaan_core::dialect::Dialect;
+use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
+use thaan_core::schema::{
+    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
+};
+use thaan_core::{Column, Error, Result, ResultSet, Value};
+use rusqlite::types::ValueRef;
+use rusqlite::{params_from_iter, Connection, OpenFlags};
+
+pub struct SqliteDriver;
+
+impl Driver for SqliteDriver {
+    fn info(&self) -> DriverInfo {
+        DriverInfo {
+            id: "sqlite".into(),
+            name: "SQLite".into(),
+            params: vec![ParamSpec::new("path", "Database file", ParamKind::File)
+                .required()
+                .placeholder("/path/to/app.db or :memory:")],
+        }
+    }
+
+    fn dialect(&self) -> Dialect {
+        Dialect::SQLITE
+    }
+
+    fn connect(&self, c: &ConnectionConfig) -> Result<Box<dyn Session>> {
+        let path = c
+            .param("path")
+            .ok_or_else(|| Error::InvalidParams("`path` is required".into()))?;
+        let conn = if path == ":memory:" {
+            Connection::open_in_memory()
+        } else {
+            let mut flags = OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            flags |= if c.read_only {
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+            };
+            Connection::open_with_flags(path, flags)
+        }
+        .map_err(db)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(db)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON").map_err(db)?;
+        if c.read_only {
+            conn.execute_batch("PRAGMA query_only = ON").map_err(db)?;
+        }
+        Ok(Box::new(SqliteSession { conn }))
+    }
+}
+
+pub struct SqliteSession {
+    conn: Connection,
+}
+
+fn db(e: rusqlite::Error) -> Error {
+    Error::Database(e.to_string())
+}
+
+fn to_sql(v: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as V;
+    match v {
+        Value::Null => V::Null,
+        Value::Bool(b) => V::Integer(*b as i64),
+        Value::Int(i) => V::Integer(*i),
+        Value::Float(f) => V::Real(*f),
+        Value::Text(s) => V::Text(s.clone()),
+        Value::Bytes(b) => V::Blob(b.clone()),
+    }
+}
+
+fn from_sql(v: ValueRef<'_>) -> Value {
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::Int(i),
+        ValueRef::Real(f) => Value::Float(f),
+        ValueRef::Text(t) => Value::Text(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Value::Bytes(b.to_vec()),
+    }
+}
+
+impl SqliteSession {
+    fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        let mut stmt = self.conn.prepare(sql).map_err(db)?;
+        let columns: Vec<Column> = stmt
+            .columns()
+            .map(|c| Column {
+                name: c.name().to_string(),
+                type_name: c.decl_type().map(str::to_string),
+            })
+            .collect();
+        let bound = params_from_iter(params.iter().map(to_sql));
+        if columns.is_empty() {
+            let n = stmt.execute(bound).map_err(db)?;
+            return Ok(ResultSet {
+                rows_affected: Some(n as u64),
+                ..Default::default()
+            });
+        }
+        let ncol = columns.len();
+        let mut rows = stmt.query(bound).map_err(db)?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().map_err(db)? {
+            let mut row = Vec::with_capacity(ncol);
+            for i in 0..ncol {
+                row.push(from_sql(r.get_ref(i).map_err(db)?));
+            }
+            out.push(row);
+        }
+        drop(rows);
+        // RETURNING clauses produce rows *and* change rows.
+        let affected = if stmt.readonly() {
+            None
+        } else {
+            Some(self.conn.changes())
+        };
+        Ok(ResultSet {
+            columns,
+            rows: out,
+            rows_affected: affected,
+            ..Default::default()
+        })
+    }
+
+    fn texts(&self, sql: &str, p: &[Value]) -> Result<Vec<Vec<Value>>> {
+        Ok(self.query(sql, p)?.rows)
+    }
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+impl Session for SqliteSession {
+    fn execute(&mut self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        self.query(sql, params)
+    }
+
+    fn list_objects(&mut self) -> Result<Vec<SchemaObject>> {
+        let rows = self.texts(
+            "SELECT type, name, tbl_name FROM sqlite_schema \
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name COLLATE NOCASE",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let kind = match text(&r[0]).as_str() {
+                    "table" => ObjectKind::Table,
+                    "view" => ObjectKind::View,
+                    "index" => ObjectKind::Index,
+                    "trigger" => ObjectKind::Trigger,
+                    _ => return None,
+                };
+                let name = text(&r[1]);
+                let parent =
+                    matches!(kind, ObjectKind::Index | ObjectKind::Trigger).then(|| text(&r[2]));
+                Some(SchemaObject {
+                    object: ObjectRef::new(name),
+                    kind,
+                    parent,
+                })
+            })
+            .collect())
+    }
+
+    fn describe_table(&mut self, t: &ObjectRef) -> Result<TableInfo> {
+        let name = Value::Text(t.name.clone());
+        let cols = self.texts(
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
+            std::slice::from_ref(&name),
+        )?;
+        if cols.is_empty() {
+            return Err(Error::Database(format!("no such table: {}", t.name)));
+        }
+        let columns = cols
+            .iter()
+            .map(|r| ColumnInfo {
+                name: text(&r[0]),
+                data_type: text(&r[1]),
+                nullable: r[2] != Value::Int(1),
+                default: (!r[3].is_null()).then(|| text(&r[3])),
+                primary_key: match r[4] {
+                    Value::Int(n) if n > 0 => Some(n as u32),
+                    _ => None,
+                },
+            })
+            .collect();
+
+        let fk_rows = self.texts(
+            "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?) ORDER BY id, seq",
+            std::slice::from_ref(&name),
+        )?;
+        let mut foreign_keys: Vec<(i64, ForeignKey)> = Vec::new();
+        for r in fk_rows {
+            let id = if let Value::Int(i) = r[0] { i } else { 0 };
+            match foreign_keys.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, fk)) => {
+                    fk.columns.push(text(&r[2]));
+                    fk.ref_columns.push(text(&r[3]));
+                }
+                None => foreign_keys.push((
+                    id,
+                    ForeignKey {
+                        columns: vec![text(&r[2])],
+                        ref_table: text(&r[1]),
+                        ref_columns: vec![text(&r[3])],
+                    },
+                )),
+            }
+        }
+
+        let idx_rows = self.texts(
+            "SELECT name, \"unique\" FROM pragma_index_list(?)",
+            std::slice::from_ref(&name),
+        )?;
+        let mut indexes = Vec::new();
+        for r in idx_rows {
+            let iname = text(&r[0]);
+            let cols = self.texts(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                &[Value::Text(iname.clone())],
+            )?;
+            indexes.push(IndexInfo {
+                name: iname,
+                columns: cols.iter().map(|c| text(&c[0])).collect(),
+                unique: r[1] == Value::Int(1),
+            });
+        }
+
+        Ok(TableInfo {
+            object: t.clone(),
+            columns,
+            foreign_keys: foreign_keys.into_iter().map(|(_, f)| f).collect(),
+            indexes,
+        })
+    }
+
+    fn ddl(&mut self, o: &ObjectRef) -> Result<String> {
+        let rows = self.texts(
+            "SELECT sql FROM sqlite_schema WHERE name = ?",
+            &[Value::Text(o.name.clone())],
+        )?;
+        let mut parts: Vec<String> = rows
+            .iter()
+            .map(|r| text(&r[0]))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err(Error::Database(format!("no such object: {}", o.name)));
+        }
+        // Include indexes and triggers of a table.
+        let extra = self.texts(
+            "SELECT sql FROM sqlite_schema WHERE tbl_name = ? AND name <> ? AND sql IS NOT NULL ORDER BY type, name",
+            &[Value::Text(o.name.clone()), Value::Text(o.name.clone())],
+        )?;
+        parts.extend(extra.iter().map(|r| text(&r[0])));
+        Ok(parts.join(";\n\n") + ";")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thaan_core::engine::{Engine, QueryRequest, RunScope};
+    use thaan_core::export::{ExportFormat, ExportOptions};
+    use thaan_core::store::Store;
+    use thaan_core::table::{Filter, FilterOp, PageRequest, StagedChange};
+    use std::sync::Arc;
+
+    fn engine() -> (Engine, u64) {
+        let e = Engine::new(Store::in_memory());
+        e.register_driver(Arc::new(SqliteDriver));
+        let s = e
+            .open(ConnectionConfig::from_url("sqlite::memory:").unwrap())
+            .unwrap();
+        let req = QueryRequest {
+            session_id: s.session_id,
+            sql: "create table users (id integer primary key, name text not null, age int default 0);\
+                  create index users_name on users(name);\
+                  create table posts (id integer primary key, user_id int references users(id), title text);\
+                  insert into users (name, age) values ('ann', 31), ('bob', 17), ('cy', 45);"
+                .into(),
+            scope: RunScope::All,
+            params: Default::default(),
+        };
+        let r = e.run_query(&req).unwrap();
+        assert!(r.iter().all(|x| x.error.is_none()), "{r:?}");
+        (e, s.session_id)
+    }
+
+    #[test]
+    fn run_query_and_params() {
+        let (e, sid) = engine();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("min".to_string(), Value::Int(18));
+        let r = e
+            .run_query(&QueryRequest {
+                session_id: sid,
+                sql: "select name from users where age >= :min order by name".into(),
+                scope: RunScope::All,
+                params,
+            })
+            .unwrap();
+        let rs = r[0].result.as_ref().unwrap();
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::from("ann")], vec![Value::from("cy")]]
+        );
+        assert_eq!(e.history(10).len(), 5);
+    }
+
+    #[test]
+    fn stops_at_first_error() {
+        let (e, sid) = engine();
+        let r = e
+            .run_query(&QueryRequest {
+                session_id: sid,
+                sql: "select 1; select * from nope; select 2".into(),
+                scope: RunScope::All,
+                params: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r[1].error.as_ref().unwrap().contains("no such table"));
+    }
+
+    #[test]
+    fn run_current_statement() {
+        let (e, sid) = engine();
+        let sql = "select 1 as a;\nselect 2 as b;";
+        let r = e
+            .run_query(&QueryRequest {
+                session_id: sid,
+                sql: sql.into(),
+                scope: RunScope::Current { cursor: 17 },
+                params: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].result.as_ref().unwrap().columns[0].name, "b");
+    }
+
+    #[test]
+    fn schema_introspection() {
+        let (e, sid) = engine();
+        let objs = e.list_objects(sid).unwrap();
+        let names: Vec<_> = objs
+            .iter()
+            .map(|o| (o.kind, o.object.name.as_str()))
+            .collect();
+        assert!(names.contains(&(ObjectKind::Table, "users")));
+        assert!(names.contains(&(ObjectKind::Index, "users_name")));
+        let t = e.describe_table(sid, &ObjectRef::new("users")).unwrap();
+        assert_eq!(t.primary_key(), ["id"]);
+        assert!(!t.columns[1].nullable);
+        assert_eq!(t.columns[2].default.as_deref(), Some("0"));
+        assert_eq!(t.indexes[0].columns, ["name"]);
+        let p = e.describe_table(sid, &ObjectRef::new("posts")).unwrap();
+        assert_eq!(p.foreign_keys[0].ref_table, "users");
+        let ddl = e.ddl(sid, &ObjectRef::new("users")).unwrap();
+        assert!(ddl.contains("CREATE INDEX users_name") || ddl.contains("create index users_name"));
+    }
+
+    #[test]
+    fn paging_filter_and_changes() {
+        let (e, sid) = engine();
+        let req = PageRequest {
+            table: ObjectRef::new("users"),
+            filters: vec![Filter {
+                column: "age".into(),
+                op: FilterOp::Ge,
+                values: vec![Value::Int(18)],
+            }],
+            raw_where: None,
+            sort: vec![],
+            page: 0,
+            page_size: 1,
+        };
+        let page = e.fetch_page(sid, &req).unwrap();
+        assert_eq!(page.total_rows, 2);
+        assert_eq!(page.page_count(), 2);
+        assert_eq!(page.result.rows.len(), 1);
+
+        let t = ObjectRef::new("users");
+        let changes = vec![
+            StagedChange::Update {
+                key: vec![("id".into(), Value::Int(2))],
+                set: vec![("age".into(), Value::Int(18))],
+            },
+            StagedChange::Insert {
+                values: vec![("name".into(), "dee".into())],
+            },
+            StagedChange::Delete {
+                key: vec![("id".into(), Value::Int(3))],
+            },
+        ];
+        assert_eq!(
+            e.preview_changes(sid, &t, &changes).unwrap()[0],
+            "UPDATE \"users\" SET \"age\" = 18 WHERE \"id\" = 2"
+        );
+        assert_eq!(e.apply_changes(sid, &t, &changes).unwrap(), 3);
+        let page = e
+            .fetch_page(
+                sid,
+                &PageRequest {
+                    page_size: 100,
+                    ..req.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.total_rows, 2); // ann, bob(18); cy deleted; dee age 0
+
+        // A failing change rolls the whole batch back.
+        let bad = vec![
+            StagedChange::Update {
+                key: vec![("id".into(), Value::Int(1))],
+                set: vec![("age".into(), Value::Int(99))],
+            },
+            StagedChange::Insert {
+                values: vec![("name".into(), Value::Null)],
+            },
+        ];
+        assert!(e.apply_changes(sid, &t, &bad).is_err());
+        let csv = e
+            .export_table(
+                sid,
+                &PageRequest {
+                    filters: vec![],
+                    ..req
+                },
+                &ExportOptions::new(ExportFormat::Csv),
+            )
+            .unwrap();
+        assert!(csv.contains("1,ann,31"), "{csv}");
+    }
+
+    #[test]
+    fn read_only_is_enforced() {
+        let dir = std::env::temp_dir().join(format!("thaan-sqlite-{}", thaan_core::store::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let e = Engine::new(Store::in_memory());
+        e.register_driver(Arc::new(SqliteDriver));
+        let mut c = ConnectionConfig::from_url(&format!("sqlite:{}", path.display())).unwrap();
+        let rw = e.open(c.clone()).unwrap();
+        let q = |sid, sql: &str| {
+            e.run_query(&QueryRequest {
+                session_id: sid,
+                sql: sql.into(),
+                scope: RunScope::All,
+                params: Default::default(),
+            })
+            .unwrap()
+        };
+        assert!(q(rw.session_id, "create table t(a)")[0].error.is_none());
+        c.read_only = true;
+        let ro = e.open(c).unwrap();
+        assert!(q(ro.session_id, "select * from t")[0].error.is_none());
+        let err = q(ro.session_id, "insert into t values (1)")[0]
+            .error
+            .clone()
+            .unwrap();
+        assert!(err.contains("read-only"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

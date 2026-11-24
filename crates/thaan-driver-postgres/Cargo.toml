@@ -1,0 +1,11 @@
+[package]
+name = "thaan-driver-postgres"
+description = "PostgreSQL driver (pure Rust, via the `postgres` crate)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thaan-core.workspace = true
+postgres = "0.19"
+bytes = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "thaan-driver-mongodb"
+description = "MongoDB driver (official `mongodb` crate, sync API)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thaan-core.workspace = true
+mongodb = { version = "3.10", features = ["sync"] }

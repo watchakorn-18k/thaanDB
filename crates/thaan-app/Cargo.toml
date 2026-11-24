@@ -1,0 +1,26 @@
+[package]
+name = "thaan-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thaan-app"
+path = "src/main.rs"
+
+[features]
+default = ["sqlite", "postgres", "mysql", "mongodb"]
+sqlite = ["dep:thaan-driver-sqlite"]
+postgres = ["dep:thaan-driver-postgres"]
+mysql = ["dep:thaan-driver-mysql"]
+mongodb = ["dep:thaan-driver-mongodb"]
+
+[dependencies]
+thaan-core.workspace = true
+thaan-driver-sqlite = { workspace = true, optional = true }
+thaan-driver-postgres = { workspace = true, optional = true }
+thaan-driver-mysql = { workspace = true, optional = true }
+thaan-driver-mongodb = { workspace = true, optional = true }
+serde_json.workspace = true
+anyhow.workspace = true
+gpui-kit = { version = "0.11.0", features = ["tree-sitter-sql", "tree-sitter-javascript"] }

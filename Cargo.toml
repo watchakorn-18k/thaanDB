@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-default-members = ["crates/dbm-core", "crates/dbm-driver-sqlite", "crates/dbm-cli"]
+default-members = ["crates/thaan-core", "crates/thaan-driver-sqlite", "crates/thaan-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +10,11 @@ license = "Apache-2.0"
 repository = ""
 
 [workspace.dependencies]
-dbm-core = { path = "crates/dbm-core" }
-dbm-driver-sqlite = { path = "crates/dbm-driver-sqlite" }
+thaan-core = { path = "crates/thaan-core" }
+thaan-driver-sqlite = { path = "crates/thaan-driver-sqlite" }
+thaan-driver-postgres = { path = "crates/thaan-driver-postgres" }
+thaan-driver-mysql = { path = "crates/thaan-driver-mysql" }
+thaan-driver-mongodb = { path = "crates/thaan-driver-mongodb" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

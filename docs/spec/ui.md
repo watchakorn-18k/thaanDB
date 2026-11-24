@@ -27,9 +27,26 @@ colours, icons and spacing are ours (see `docs/clean-room.md`).
 
 ## Theme tokens
 
-The palette lives in `crates/dbm-app/src/theme.rs` as named tokens (`bg`, `panel`, `border`,
+The palette lives in `crates/thaan-app/src/theme.rs` as named tokens (`bg`, `panel`, `border`,
 `text`, `muted`, `accent`, `danger`, `success`, `warning`). The accent is a teal (#14b8a6
-in dark mode), a deliberate choice of our own.
+in dark mode), a deliberate choice of our own. Text on the dark-mode teal is near-black
+(#06201d) for contrast; the light-mode teal (#0f766e) takes white.
+
+## Visual rules
+
+- Surfaces stay graphite; the teal marks only the primary action, the active tab and the caret.
+- The connection's own colour appears only as an 8px dot (title bar, saved list). It is the
+  one other colour in the chrome.
+- Labels are sentence case at weight 500, never uppercase; counts follow in muted mono
+  (`Tables 2`). No italic: `NULL` is muted mono text.
+- Figures (numeric cells, counts, timings, page numbers) and SQL use the mono face; numeric
+  cells align right.
+- Spacing is on a 4px grid. One-line rows in the sidebar are 28px, palette rows 32px,
+  toolbars and the header 36px.
+- Shortcuts are drawn as keycaps. Copy says `1 row` / `6 rows`, never `row(s)`, and short
+  labels and empty states end without a period.
+- The table footer keeps two labelled groups: *Export* (writes a file) and *Copy as*
+  (clipboard).
 
 ## Data-driven UI
 

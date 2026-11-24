@@ -4,8 +4,11 @@ Behaviour-level spec of what the app does. It is written in our own words from p
 docs and from using SQL clients as a user (see `docs/clean-room.md`). Every row maps to
 one or more stable `CommandId`s that the GUI, CLI and MCP all dispatch.
 
-Status: `engine` = in `dbm-core` with tests and reachable from the CLI (`dbm run <id>`), `gui` = also wired
+Status: `engine` = in `thaan-core` with tests and reachable from the CLI (`thaan run <id>`), `gui` = also wired
 in the GPUI app, `todo` = not started. `engine+gui` means both.
+
+Workspace usability details (connection picker, schema tree, filter row, grid gutter,
+status bar) are specified in `docs/spec/workspace.md`; the rows below link to its sections.
 
 ## 1. Connections
 
@@ -25,19 +28,19 @@ in the GPUI app, `todo` = not started. `engine+gui` means both.
 
 | Driver | Crate | Status |
 | --- | --- | --- |
-| SQLite | `dbm-driver-sqlite` (rusqlite, feature-gated C) | engine+gui |
-| PostgreSQL / CockroachDB / Redshift | `dbm-driver-postgres` (tokio-postgres, pure Rust) | todo |
-| MySQL / MariaDB / TiDB | `dbm-driver-mysql` (mysql_async, pure Rust) | todo |
-| SQL Server | `dbm-driver-mssql` (tiberius) | todo |
+| SQLite | `thaan-driver-sqlite` (rusqlite, feature-gated C) | engine+gui |
+| PostgreSQL / CockroachDB / Redshift | `thaan-driver-postgres` (tokio-postgres, pure Rust) | todo |
+| MySQL / MariaDB / TiDB | `thaan-driver-mysql` (mysql_async, pure Rust) | todo |
+| SQL Server | `thaan-driver-mssql` (tiberius) | todo |
 | ClickHouse, DuckDB, LibSQL, Oracle, Firebird, MongoDB, Redis, Cassandra, BigQuery | one crate each | todo |
 
 ## 2. Schema browser (sidebar)
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Database / schema picker | Switch database or schema of the active session | `schema.listDatabases`, `schema.setDatabase` | todo |
-| Object tree | Tables, views, materialized views, routines, triggers, sequences; lazy-loaded | `schema.listObjects` | engine+gui (eager, not lazy) |
-| Columns under a table | Expand a table to see columns with types, PK/FK markers | `schema.describeTable` | engine; gui shows them in the Structure view, not in the tree |
+| Database / schema picker | Switch database or schema of the active session, from the top of the sidebar (workspace.md §1) | `schema.listDatabases`, `schema.setDatabase` | todo |
+| Object tree | Tables, views, materialized views, routines, triggers, sequences; grouped by schema, lazy-loaded (workspace.md §2) | `schema.listObjects` | engine+gui (eager, not lazy) |
+| Columns under a table | Expand a table to see columns with types, PK/FK markers (workspace.md §2) | `schema.describeTable` | engine; gui shows them in the Structure view, not in the tree |
 | Filter | Type to filter the tree by name | (GUI-local) | gui |
 | Pin / favourite tables | Pinned items listed at the top | `schema.pin` | todo |
 | Context menu | Open data, open structure, copy name, generate SELECT/INSERT, drop, truncate, export | (dispatches other commands) | todo |
@@ -64,8 +67,8 @@ in the GPUI app, `todo` = not started. `engine+gui` means both.
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Virtualized grid | Millions of rows scroll smoothly; column resize | (GUI) | gui |
-| Row count, duration, affected rows | Shown in the result status bar | — | engine+gui |
+| Virtualized grid | Millions of rows scroll smoothly; column resize; row-number gutter; headers show type and PK mark (workspace.md §4) | (GUI) | gui |
+| Row count, duration, affected rows | Shown in the single bottom status bar with paging, refresh and last-fetched time (workspace.md §5) | — | engine+gui |
 | Copy | Whole result as CSV / JSON / Markdown / SQL INSERT (cell/selection copy todo) | `result.export` | engine+gui |
 | JSON / long text viewer | Side panel shows the selected cell formatted | (GUI) | todo |
 | Export | CSV, TSV, JSON, JSON Lines, SQL INSERT, Markdown, Excel | `result.export` | engine (no Excel) |
@@ -75,7 +78,7 @@ in the GPUI app, `todo` = not started. `engine+gui` means both.
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
 | Open table | Paged rows (default 100), server-side sort and filter | `table.fetchPage` | engine+gui (header sort is client-side in gui) |
-| Filter builder | Column + operator + value rows, or raw `WHERE` | `table.fetchPage` (filters) | engine; gui has the raw `WHERE` box only |
+| Filter builder | Column + operator + value rows, or raw `WHERE` (workspace.md §3) | `table.fetchPage` (filters) | engine; gui has the raw `WHERE` box only |
 | Inline edit | Edit cells, add rows, delete rows; changes staged and highlighted | `table.stageChange` | todo |
 | Apply / discard | Apply staged changes in one transaction, or preview the SQL | `table.applyChanges`, `table.previewChanges` | engine |
 | Set NULL / default | Per-cell actions | (staged change) | todo |
@@ -114,5 +117,5 @@ in the GPUI app, `todo` = not started. `engine+gui` means both.
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| CLI | `dbm query/tables/describe/ddl/export/run` | every id above | engine |
+| CLI | `thaan query/tables/describe/ddl/export/run` | every id above | engine |
 | MCP server | Expose the command registry as MCP tools | every id above | todo |
