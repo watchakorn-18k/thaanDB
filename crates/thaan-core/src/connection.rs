@@ -70,7 +70,7 @@ impl ConnectionConfig {
                     params.insert("password".into(), percent_decode(pass));
                 }
             }
-            let path = hosts.split_once('?').map(|x| x.0).unwrap_or(hosts);
+            let path = hosts.split_once('?').map_or(hosts, |x| x.0);
             let host_part = path.split('/').next().unwrap_or("");
             if let Some(db) = path.split_once('/').map(|x| x.1).filter(|d| !d.is_empty()) {
                 params.insert("database".into(), percent_decode(db));
@@ -80,7 +80,12 @@ impl ConnectionConfig {
                 Some(db) => format!("{db}@{host_part}"),
                 None => host_part.to_string(),
             };
-            return Ok(ConnectionConfig { name, driver, params, ..Default::default() });
+            return Ok(ConnectionConfig {
+                name,
+                driver,
+                params,
+                ..Default::default()
+            });
         }
         if driver == "sqlite" {
             let path = rest.strip_prefix("//").unwrap_or(rest);

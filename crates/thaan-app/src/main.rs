@@ -1,6 +1,7 @@
 //! Desktop app (GPUI). One client of `thaan-core`; see AGENTS.md.
 
 mod app;
+mod docview;
 mod grid;
 mod logo;
 mod theme;

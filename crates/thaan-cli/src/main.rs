@@ -2,6 +2,9 @@
 //! `thaan run <commandId> '<json>'`.
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value as Json};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use thaan_core::commands::{builtin_commands, dispatch};
 use thaan_core::connection::ConnectionConfig;
 use thaan_core::engine::{Engine, QueryRequest, RunScope};
@@ -10,9 +13,6 @@ use thaan_core::schema::ObjectRef;
 use thaan_core::store::Store;
 use thaan_core::table::PageRequest;
 use thaan_core::{ResultSet, Value};
-use serde_json::{json, Value as Json};
-use std::collections::BTreeMap;
-use std::sync::Arc;
 
 const USAGE: &str = "\
 thaan — ThaanDB command-line client
@@ -278,6 +278,8 @@ fn real_main() -> Result<()> {
                 table: ObjectRef::new(args.pos(2, "table")?),
                 filters: vec![],
                 raw_where: args.flag("where").map(str::to_string),
+                projection: None,
+                raw_sort: None,
                 sort: vec![],
                 page: 0,
                 page_size: 100,

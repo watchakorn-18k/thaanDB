@@ -1,6 +1,8 @@
 //! SQLite driver, written from the SQLite documentation (sqlite.org/lang.html,
 //! sqlite.org/pragma.html, sqlite.org/schematab.html).
 
+use rusqlite::types::ValueRef;
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 use thaan_core::connection::ConnectionConfig;
 use thaan_core::dialect::Dialect;
 use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
@@ -8,8 +10,6 @@ use thaan_core::schema::{
     ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
 };
 use thaan_core::{Column, Error, Result, ResultSet, Value};
-use rusqlite::types::ValueRef;
-use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 pub struct SqliteDriver;
 
@@ -58,6 +58,7 @@ pub struct SqliteSession {
     conn: Connection,
 }
 
+#[allow(clippy::needless_pass_by_value)] // by value so it can be `map_err(db)`
 fn db(e: rusqlite::Error) -> Error {
     Error::Database(e.to_string())
 }
@@ -270,11 +271,11 @@ impl Session for SqliteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use thaan_core::engine::{Engine, QueryRequest, RunScope};
     use thaan_core::export::{ExportFormat, ExportOptions};
     use thaan_core::store::Store;
     use thaan_core::table::{Filter, FilterOp, PageRequest, StagedChange};
-    use std::sync::Arc;
 
     fn engine() -> (Engine, u64) {
         let e = Engine::new(Store::in_memory());
@@ -381,6 +382,8 @@ mod tests {
                 values: vec![Value::Int(18)],
             }],
             raw_where: None,
+            projection: None,
+            raw_sort: None,
             sort: vec![],
             page: 0,
             page_size: 1,
@@ -445,7 +448,8 @@ mod tests {
 
     #[test]
     fn read_only_is_enforced() {
-        let dir = std::env::temp_dir().join(format!("thaan-sqlite-{}", thaan_core::store::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("thaan-sqlite-{}", thaan_core::store::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.db");
         let e = Engine::new(Store::in_memory());

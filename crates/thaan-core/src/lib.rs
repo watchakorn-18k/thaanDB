@@ -6,6 +6,7 @@
 pub mod commands;
 pub mod connection;
 pub mod dialect;
+pub mod doc;
 pub mod driver;
 pub mod engine;
 pub mod error;

@@ -16,7 +16,9 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | --- | --- | --- | --- |
 | Connection list | Saved connections with name, colour label, driver, host/db; grouped in folders | `connection.list` | engine+gui (folders todo) |
 | New / edit / delete connection | Form generated from the driver's parameter schema | `connection.save`, `connection.delete` | engine+gui |
-| Test connection | Connect, run a trivial query, report latency or error | `connection.test` | engine+gui |
+| Test connection | Connect, run a trivial query (`ping` for MongoDB), report latency or error | `connection.test` | engine+gui |
+| Driver picker | Buttons for every registered driver; the form below is rebuilt from the chosen driver's parameters | — | gui |
+| Connect off the UI thread | Connect, Test and schema loading run on a background thread; the buttons show "Connecting…" and are disabled meanwhile, and the window stays responsive | — | gui |
 | Connect / disconnect | Opens a session; several sessions can be open at once | `connection.open`, `connection.close` | engine+gui |
 | Connection URL import | Paste `postgres://…` / `mysql://…` / `sqlite:…` to fill the form | `connection.parseUrl` | engine+gui |
 | SSH tunnel | Host, port, user, password or key file, optional bastion | `connection.sshTunnel` | todo |
@@ -29,10 +31,11 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | Driver | Crate | Status |
 | --- | --- | --- |
 | SQLite | `thaan-driver-sqlite` (rusqlite, feature-gated C) | engine+gui |
-| PostgreSQL / CockroachDB / Redshift | `thaan-driver-postgres` (tokio-postgres, pure Rust) | todo |
-| MySQL / MariaDB / TiDB | `thaan-driver-mysql` (mysql_async, pure Rust) | todo |
+| PostgreSQL / CockroachDB / Redshift | `thaan-driver-postgres` (`postgres` crate, pure Rust; TLS todo) | engine+gui (tested live on PostgreSQL 17) |
+| MySQL / MariaDB / TiDB | `thaan-driver-mysql` (`mysql` crate, pure Rust; TLS todo) | engine+gui (tested live on MySQL 8.4) |
+| MongoDB | `thaan-driver-mongodb` (official `mongodb` crate, sync API) | engine+gui (tested live on MongoDB 7) |
 | SQL Server | `thaan-driver-mssql` (tiberius) | todo |
-| ClickHouse, DuckDB, LibSQL, Oracle, Firebird, MongoDB, Redis, Cassandra, BigQuery | one crate each | todo |
+| ClickHouse, DuckDB, LibSQL, Oracle, Firebird, Redis, Cassandra, BigQuery | one crate each | todo |
 
 ## 2. Schema browser (sidebar)
 
@@ -67,7 +70,7 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Virtualized grid | Millions of rows scroll smoothly; column resize; row-number gutter; headers show type and PK mark (workspace.md §4) | (GUI) | gui |
+| Virtualized grid | Millions of rows scroll smoothly; column resize; row-number gutter; headers show type and PK mark (workspace.md §4) | (GUI) | gui (gutter, header types and PK mark done) |
 | Row count, duration, affected rows | Shown in the single bottom status bar with paging, refresh and last-fetched time (workspace.md §5) | — | engine+gui |
 | Copy | Whole result as CSV / JSON / Markdown / SQL INSERT (cell/selection copy todo) | `result.export` | engine+gui |
 | JSON / long text viewer | Side panel shows the selected cell formatted | (GUI) | todo |
@@ -77,8 +80,8 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Open table | Paged rows (default 100), server-side sort and filter | `table.fetchPage` | engine+gui (header sort is client-side in gui) |
-| Filter builder | Column + operator + value rows, or raw `WHERE` (workspace.md §3) | `table.fetchPage` (filters) | engine; gui has the raw `WHERE` box only |
+| Open table | Paged rows (default 100), server-side sort and filter | `table.fetchPage` | engine+gui (header sort runs on the server for table tabs) |
+| Filter builder | Column + operator + value rows, or raw `WHERE` (workspace.md §3) | `table.fetchPage` (filters) | engine+gui (MongoDB tabs keep the raw query box) |
 | Inline edit | Edit cells, add rows, delete rows; changes staged and highlighted | `table.stageChange` | todo |
 | Apply / discard | Apply staged changes in one transaction, or preview the SQL | `table.applyChanges`, `table.previewChanges` | engine |
 | Set NULL / default | Per-cell actions | (staged change) | todo |
@@ -113,7 +116,24 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | Team workspaces / sync | Optional self-hostable sync of connections and saved queries (no secrets) | `workspace.*` | todo |
 | Entity-relationship diagram | Auto-layout diagram of tables and FKs | `schema.erDiagram` | todo |
 
-## 9. Headless access
+## 9. MongoDB
+
+Behaviour written from the MongoDB manual and from using document databases as a user.
+No other client's code or binaries were studied (see `docs/clean-room.md`).
+
+| Feature | Behaviour | CommandId | Status |
+| --- | --- | --- | --- |
+| Connect | Connection string (several hosts, options) + user/password stored apart from it; database picked from the field or the URI path | `connection.open` | engine+gui |
+| Collections in the sidebar | Collections and views, with their indexes; sidebar heading says "Collections" | `schema.listObjects` | engine+gui |
+| Shell-style queries | `db.<coll>.find/findOne/aggregate/countDocuments/distinct/insertOne/insertMany/updateOne/updateMany/replaceOne/deleteOne/deleteMany/createIndex/getIndexes/drop`, `db.createCollection`, `db.runCommand`, `show collections`, `show dbs`; cursor `.sort().skip().limit().projection().count()`; values are relaxed JSON plus `ObjectId()`, `ISODate()`, `NumberInt/Long/Decimal()`, `UUID()`, `/regex/` | `query.runAll`, `query.runCurrent` | engine+gui (JavaScript highlighting) |
+| Result grid | One row per document; columns are the union of top-level fields (`_id` first); nested objects/arrays shown as shell text; `find` without `.limit()` returns at most 1000 documents | — | engine+gui |
+| Collection view | Paged documents; Filter, Projection and Sort boxes each take a document (`{ age: { $gt: 30 } }`); footer reads "Documents a–b of n" | `table.fetchPage` (`rawWhere`, `projection`, `rawSort`) | engine+gui |
+| Result views | Table · Tree · JSON switch for query and collection results; objects/arrays summarised in the table; values coloured by BSON type. Details: `docs/spec/mongodb-ui.md` | — | gui |
+| Schema view | Fields inferred from a 100-document sample (types seen, "nullable" when missing or null), indexes; "DDL" is `db.createCollection(...)` + `createIndex(...)` | `schema.describeTable`, `structure.ddl` | engine+gui |
+| Edit documents | Staged `$set` / insert / delete by `_id`, previewed as shell commands; applied one by one (no transaction without a replica set) | `table.previewChanges`, `table.applyChanges` | engine (gui editing todo, as for SQL) |
+| Read-only | The driver refuses writes, including `$out` / `$merge` aggregations and non-read `runCommand`s | — | engine |
+
+## 10. Headless access
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |

@@ -7,6 +7,9 @@
 mod decode;
 
 use bytes::BytesMut;
+use postgres::types::{to_sql_checked, Format, FromSql, IsNull, ToSql, Type};
+use postgres::{Client, NoTls};
+use std::time::Duration;
 use thaan_core::connection::ConnectionConfig;
 use thaan_core::dialect::Dialect;
 use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
@@ -14,9 +17,6 @@ use thaan_core::schema::{
     ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
 };
 use thaan_core::{Column, Error, Result, ResultSet, Value};
-use postgres::types::{to_sql_checked, Format, FromSql, IsNull, ToSql, Type};
-use postgres::{Client, NoTls};
-use std::time::Duration;
 
 pub struct PostgresDriver;
 
@@ -72,6 +72,7 @@ impl Driver for PostgresDriver {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)] // by value so it can be `map_err(db)`
 fn db(e: postgres::Error) -> Error {
     // Prefer the server's message ("relation \"x\" does not exist") over the wrapper text.
     match e.as_db_error() {
@@ -99,7 +100,10 @@ impl ToSql for TextParam {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Text(s) => s.clone(),
-            Value::Bytes(b) => format!("\\x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+            Value::Bytes(b) => format!(
+                "\\x{}",
+                decode::hex(b)
+            ),
         };
         out.extend_from_slice(text.as_bytes());
         Ok(IsNull::No)
@@ -127,7 +131,9 @@ impl<'a> FromSql<'a> for Raw {
         Ok(Raw(decode::value(ty, raw)))
     }
 
-    fn from_sql_null(_: &Type) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql_null(
+        _: &Type,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(Raw(Value::Null))
     }
 
@@ -155,15 +161,22 @@ impl PgSession {
             )));
         }
         let owned: Vec<TextParam> = params.iter().cloned().map(TextParam).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = owned.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            owned.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         if stmt.columns().is_empty() {
             let n = self.client.execute(&stmt, &refs).map_err(db)?;
-            return Ok(ResultSet { rows_affected: Some(n), ..Default::default() });
+            return Ok(ResultSet {
+                rows_affected: Some(n),
+                ..Default::default()
+            });
         }
         let columns: Vec<Column> = stmt
             .columns()
             .iter()
-            .map(|c| Column { name: c.name().to_string(), type_name: Some(c.type_().name().to_string()) })
+            .map(|c| Column {
+                name: c.name().to_string(),
+                type_name: Some(c.type_().name().to_string()),
+            })
             .collect();
         let rows = self.client.query(&stmt, &refs).map_err(db)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -175,7 +188,11 @@ impl PgSession {
             }
             out.push(row);
         }
-        Ok(ResultSet { columns, rows: out, ..Default::default() })
+        Ok(ResultSet {
+            columns,
+            rows: out,
+            ..Default::default()
+        })
     }
 
     fn qualified(&self, o: &ObjectRef) -> Value {
@@ -191,7 +208,11 @@ fn text(v: &Value) -> String {
 }
 
 fn split_list(v: &Value) -> Vec<String> {
-    text(v).split('\u{1f}').filter(|s| !s.is_empty()).map(str::to_string).collect()
+    text(v)
+        .split('\u{1f}')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 const USER_SCHEMAS: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema') \
@@ -226,7 +247,10 @@ impl Session for PgSession {
             };
             let parent = (kind == ObjectKind::Index).then(|| text(&r[3]));
             out.push(SchemaObject {
-                object: ObjectRef { schema: Some(text(&r[0])), name: text(&r[1]) },
+                object: ObjectRef {
+                    schema: Some(text(&r[0])),
+                    name: text(&r[1]),
+                },
                 kind,
                 parent,
             });
@@ -240,7 +264,10 @@ impl Session for PgSession {
             &[],
         )?;
         out.extend(triggers.iter().map(|r| SchemaObject {
-            object: ObjectRef { schema: Some(text(&r[0])), name: text(&r[1]) },
+            object: ObjectRef {
+                schema: Some(text(&r[0])),
+                name: text(&r[1]),
+            },
             kind: ObjectKind::Trigger,
             parent: Some(text(&r[2])),
         }));
@@ -254,7 +281,10 @@ impl Session for PgSession {
             &[],
         )?;
         out.extend(routines.iter().map(|r| SchemaObject {
-            object: ObjectRef { schema: Some(text(&r[0])), name: text(&r[1]) },
+            object: ObjectRef {
+                schema: Some(text(&r[0])),
+                name: text(&r[1]),
+            },
             kind: ObjectKind::Routine,
             parent: None,
         }));
@@ -263,11 +293,15 @@ impl Session for PgSession {
 
     fn describe_table(&mut self, t: &ObjectRef) -> Result<TableInfo> {
         let q = self.qualified(t);
-        if self.rows("SELECT to_regclass($1)::text", std::slice::from_ref(&q))?
+        if self
+            .rows("SELECT to_regclass($1)::text", std::slice::from_ref(&q))?
             .first()
             .is_none_or(|r| r[0].is_null())
         {
-            return Err(Error::Database(format!("relation {} does not exist", text(&q))));
+            return Err(Error::Database(format!(
+                "relation {} does not exist",
+                text(&q)
+            )));
         }
         let cols = self.rows(
             "SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
@@ -308,7 +342,11 @@ impl Session for PgSession {
         )?;
         let foreign_keys = fks
             .iter()
-            .map(|r| ForeignKey { columns: split_list(&r[0]), ref_table: text(&r[1]), ref_columns: split_list(&r[2]) })
+            .map(|r| ForeignKey {
+                columns: split_list(&r[0]),
+                ref_table: text(&r[1]),
+                ref_columns: split_list(&r[2]),
+            })
             .collect();
         let idx = self.rows(
             "SELECT ic.relname, i.indisunique, \
@@ -321,27 +359,54 @@ impl Session for PgSession {
         )?;
         let indexes = idx
             .iter()
-            .map(|r| IndexInfo { name: text(&r[0]), columns: split_list(&r[2]), unique: r[1] == Value::Bool(true) })
+            .map(|r| IndexInfo {
+                name: text(&r[0]),
+                columns: split_list(&r[2]),
+                unique: r[1] == Value::Bool(true),
+            })
             .collect();
-        Ok(TableInfo { object: t.clone(), columns, foreign_keys, indexes })
+        Ok(TableInfo {
+            object: t.clone(),
+            columns,
+            foreign_keys,
+            indexes,
+        })
     }
 
     fn ddl(&mut self, o: &ObjectRef) -> Result<String> {
         let q = self.qualified(o);
         let quoted = text(&q);
         let kind = self
-            .rows("SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass($1)", std::slice::from_ref(&q))?
+            .rows(
+                "SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass($1)",
+                std::slice::from_ref(&q),
+            )?
             .first()
             .map(|r| text(&r[0]));
         match kind.as_deref() {
             Some("v") | Some("m") => {
-                let def = self.rows("SELECT pg_get_viewdef($1::regclass, true)", std::slice::from_ref(&q))?;
-                let m = if kind.as_deref() == Some("m") { "MATERIALIZED " } else { "" };
-                Ok(format!("CREATE {m}VIEW {quoted} AS\n{}", text(&def[0][0]).trim_end()))
+                let def = self.rows(
+                    "SELECT pg_get_viewdef($1::regclass, true)",
+                    std::slice::from_ref(&q),
+                )?;
+                let m = if kind.as_deref() == Some("m") {
+                    "MATERIALIZED "
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "CREATE {m}VIEW {quoted} AS\n{}",
+                    text(&def[0][0]).trim_end()
+                ))
             }
             Some("i") => Ok(format!(
                 "{};",
-                text(&self.rows("SELECT pg_get_indexdef($1::regclass)", std::slice::from_ref(&q))?[0][0])
+                text(
+                    &self.rows(
+                        "SELECT pg_get_indexdef($1::regclass)",
+                        std::slice::from_ref(&q)
+                    )?[0][0]
+                )
             )),
             Some("S") => Ok(format!("CREATE SEQUENCE {quoted};")),
             Some(_) => self.table_ddl(o, &q),
@@ -356,7 +421,11 @@ impl Session for PgSession {
                     &[schema.clone(), name.clone()],
                 )?;
                 if !f.is_empty() {
-                    return Ok(f.iter().map(|r| text(&r[0])).collect::<Vec<_>>().join(";\n\n"));
+                    return Ok(f
+                        .iter()
+                        .map(|r| text(&r[0]))
+                        .collect::<Vec<_>>()
+                        .join(";\n\n"));
                 }
                 let t = self.rows(
                     "SELECT pg_get_triggerdef(tg.oid, true) FROM pg_trigger tg \
@@ -397,7 +466,13 @@ impl PgSession {
              ORDER BY CASE contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 ELSE 3 END, conname",
             std::slice::from_ref(q),
         )?;
-        lines.extend(cons.iter().map(|r| format!("    CONSTRAINT {} {}", d.quote_ident(&text(&r[0])), text(&r[1]))));
+        lines.extend(cons.iter().map(|r| {
+            format!(
+                "    CONSTRAINT {} {}",
+                d.quote_ident(&text(&r[0])),
+                text(&r[1])
+            )
+        }));
         let mut out = format!("CREATE TABLE {} (\n{}\n);", text(q), lines.join(",\n"));
         // Indexes that do not back a constraint, then triggers.
         let extra = self.rows(
@@ -420,10 +495,10 @@ impl PgSession {
 mod tests {
     //! Live tests need a server: `THAAN_TEST_POSTGRES_URL=postgres://user:pw@host:port/db`.
     use super::*;
+    use std::sync::Arc;
     use thaan_core::engine::{Engine, QueryRequest, RunScope};
     use thaan_core::store::Store;
     use thaan_core::table::{PageRequest, StagedChange};
-    use std::sync::Arc;
 
     fn engine() -> Option<(Engine, u64)> {
         let url = std::env::var("THAAN_TEST_POSTGRES_URL").ok()?;
@@ -434,8 +509,13 @@ mod tests {
     }
 
     fn run(e: &Engine, sid: u64, sql: &str) -> Vec<thaan_core::engine::StatementResult> {
-        e.run_query(&QueryRequest { session_id: sid, sql: sql.into(), scope: RunScope::All, params: Default::default() })
-            .unwrap()
+        e.run_query(&QueryRequest {
+            session_id: sid,
+            sql: sql.into(),
+            scope: RunScope::All,
+            params: Default::default(),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -458,7 +538,11 @@ mod tests {
         );
         assert!(r.iter().all(|x| x.error.is_none()), "{r:?}");
 
-        let r = run(&e, sid, "SELECT name, score, born, seen, tags, meta, uid, ok FROM thaan_t.users ORDER BY id");
+        let r = run(
+            &e,
+            sid,
+            "SELECT name, score, born, seen, tags, meta, uid, ok FROM thaan_t.users ORDER BY id",
+        );
         let rs = r[0].result.as_ref().unwrap();
         assert_eq!(
             rs.rows[0],
@@ -487,28 +571,64 @@ mod tests {
                 params,
             })
             .unwrap();
-        assert_eq!(r[0].result.as_ref().unwrap().rows, vec![vec![Value::Int(1)]]);
+        assert_eq!(
+            r[0].result.as_ref().unwrap().rows,
+            vec![vec![Value::Int(1)]]
+        );
 
         let objs = e.list_objects(sid).unwrap();
-        assert!(objs.iter().any(|o| o.kind == ObjectKind::View && o.object.name == "v"));
-        assert!(objs.iter().any(|o| o.kind == ObjectKind::Index && o.object.name == "posts_user"));
-        let t = ObjectRef { schema: Some("thaan_t".into()), name: "users".into() };
+        assert!(objs
+            .iter()
+            .any(|o| o.kind == ObjectKind::View && o.object.name == "v"));
+        assert!(objs
+            .iter()
+            .any(|o| o.kind == ObjectKind::Index && o.object.name == "posts_user"));
+        let t = ObjectRef {
+            schema: Some("thaan_t".into()),
+            name: "users".into(),
+        };
         let info = e.describe_table(sid, &t).unwrap();
         assert_eq!(info.primary_key(), ["id"]);
         assert!(!info.columns[1].nullable);
-        let posts = e.describe_table(sid, &ObjectRef { schema: Some("thaan_t".into()), name: "posts".into() }).unwrap();
+        let posts = e
+            .describe_table(
+                sid,
+                &ObjectRef {
+                    schema: Some("thaan_t".into()),
+                    name: "posts".into(),
+                },
+            )
+            .unwrap();
         assert_eq!(posts.foreign_keys[0].columns, ["user_id"]);
-        assert!(e.ddl(sid, &t).unwrap().starts_with("CREATE TABLE \"thaan_t\".\"users\""));
+        assert!(e
+            .ddl(sid, &t)
+            .unwrap()
+            .starts_with("CREATE TABLE \"thaan_t\".\"users\""));
 
         let page = e
-            .fetch_page(sid, &PageRequest { table: t.clone(), filters: vec![], raw_where: None, sort: vec![], page: 0, page_size: 1 })
+            .fetch_page(
+                sid,
+                &PageRequest {
+                    table: t.clone(),
+                    filters: vec![],
+                    raw_where: None,
+                    projection: None,
+                    raw_sort: None,
+                    sort: vec![],
+                    page: 0,
+                    page_size: 1,
+                },
+            )
             .unwrap();
         assert_eq!(page.total_rows, 2);
         let n = e
             .apply_changes(
                 sid,
                 &t,
-                &[StagedChange::Update { key: vec![("id".into(), Value::Int(2))], set: vec![("score".into(), Value::Float(9.5))] }],
+                &[StagedChange::Update {
+                    key: vec![("id".into(), Value::Int(2))],
+                    set: vec![("score".into(), Value::Float(9.5))],
+                }],
             )
             .unwrap();
         assert_eq!(n, 1);

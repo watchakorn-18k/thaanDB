@@ -1,13 +1,20 @@
 //! Main window. All work is dispatched to `thaan_core::Engine`; this file only holds view
 //! state and layout (see AGENTS.md, principle 1 and 3).
 
+#[path = "home.rs"]
+mod home;
+
+use crate::docview::{view_switch, DocPanel, DocView};
 use crate::grid::ResultGrid;
 use crate::theme;
 use gpui_kit::base::{Disableable as _, Selectable as _, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::table::{ColumnSort, DataTable, TableState};
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::{
     h_flex, h_resizable, resizable_panel, v_flex, v_resizable, ActiveTheme as _, Icon, Sizable as _,
 };
@@ -22,7 +29,7 @@ use thaan_core::engine::{Engine, QueryRequest, RunScope, SessionInfo, StatementR
 use thaan_core::export::{ExportFormat, ExportOptions};
 use thaan_core::schema::{ObjectKind, ObjectRef, SchemaObject, TableInfo};
 use thaan_core::store::{HistoryEntry, SavedQuery};
-use thaan_core::table::{PageRequest, Sort};
+use thaan_core::table::{Filter, FilterOp, PageRequest, Sort};
 use thaan_core::ResultSet;
 
 actions!(
@@ -87,21 +94,81 @@ struct QueryTab {
     results: Vec<StatementResult>,
     active_result: usize,
     grid: Entity<TableState<ResultGrid>>,
+    /// Tree / JSON views of document results (MongoDB).
+    docs: Entity<DocPanel>,
     running: bool,
+}
+
+type Choice = Entity<SelectState<Vec<SharedString>>>;
+
+/// One column / operator / value row of the filter builder (docs/spec/workspace.md §3).
+struct FilterRow {
+    id: usize,
+    column: Choice,
+    op: Choice,
+    value: Entity<InputState>,
 }
 
 struct TableTab {
     object: ObjectRef,
     info: Option<TableInfo>,
     ddl: Option<String>,
+    /// Raw `WHERE` text (or a document query on MongoDB).
     filter: Entity<InputState>,
+    /// Builder rows, combined with AND. Both modes keep their text across a switch.
+    filter_rows: Vec<FilterRow>,
+    next_filter_id: usize,
+    /// `true` while the raw `WHERE` box is shown instead of the builder.
+    raw_mode: bool,
+    /// Page number box in the status bar (1-based); Enter jumps there.
+    page_input: Entity<InputState>,
+    /// When the current page arrived, for the "fetched … ago" note.
+    fetched_at: Option<std::time::Instant>,
     page: Option<TablePage>,
     page_ix: u64,
     sort: Vec<Sort>,
     view: TableView,
     grid: Entity<TableState<ResultGrid>>,
+    docs: Entity<DocPanel>,
+    /// MongoDB: projection and sort documents next to the filter document.
+    projection: Entity<InputState>,
+    sort_doc: Entity<InputState>,
     error: Option<String>,
     loading: bool,
+}
+
+impl TableTab {
+    /// The structured filters and raw `WHERE` text for the mode that is showing.
+    /// MongoDB projection and sort documents (empty boxes mean none).
+    fn document_shape(&self, cx: &App) -> (Option<String>, Option<String>) {
+        let text = |i: &Entity<InputState>| {
+            let v = i.read(cx).value().trim().to_string();
+            (!v.is_empty()).then_some(v)
+        };
+        (text(&self.projection), text(&self.sort_doc))
+    }
+
+    fn where_parts(&self, cx: &App) -> (Vec<Filter>, Option<String>) {
+        if self.raw_mode {
+            let raw = self.filter.read(cx).value().trim().to_string();
+            return (Vec::new(), (!raw.is_empty()).then_some(raw));
+        }
+        let filters = self
+            .filter_rows
+            .iter()
+            .filter_map(|r| {
+                let column = r.column.read(cx).selected_value()?.to_string();
+                let op = FilterOp::from_title(r.op.read(cx).selected_value()?)?;
+                let data_type = self
+                    .info
+                    .as_ref()
+                    .and_then(|i| i.columns.iter().find(|c| c.name == column))
+                    .map(|c| c.data_type.as_str());
+                Filter::from_text(&column, op, &r.value.read(cx).value(), data_type)
+            })
+            .collect();
+        (filters, None)
+    }
 }
 
 enum Tab {
@@ -128,6 +195,8 @@ pub struct ThaanApp {
     conn_url: Entity<InputState>,
     conn_params: Vec<(String, ParamKind, Entity<InputState>)>,
     conn_read_only: bool,
+    /// A connect or test is running on a background thread.
+    connecting: bool,
     connections: Vec<ConnectionConfig>,
     // workspace
     session: Option<SessionInfo>,
@@ -140,18 +209,24 @@ pub struct ThaanApp {
     palette_open: bool,
     palette_input: Entity<InputState>,
     status: Option<(SharedString, bool)>,
+    /// Home screen and New connection dialog state.
+    home: home::HomeState,
 }
 
 impl ThaanApp {
     pub fn new(engine: Arc<Engine>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let drivers = engine.drivers();
         // Invariant: main() registers at least one driver.
-        let driver = drivers.first().cloned().expect("at least one driver is registered");
+        let driver = drivers
+            .first()
+            .cloned()
+            .expect("at least one driver is registered");
         let conn_params = Self::param_inputs(&driver, window, cx);
         let conn_name = cx.new(|cx| InputState::new(window, cx).placeholder("My database"));
         let conn_url = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("postgres://user@host/db   mysql://…   mongodb://…   sqlite:/path/app.db")
+            InputState::new(window, cx).placeholder(
+                "postgres://user@host/db   mysql://…   mongodb://…   sqlite:/path/app.db",
+            )
         });
         let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands"));
@@ -159,7 +234,18 @@ impl ThaanApp {
             .detach();
         cx.subscribe(&palette_input, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
+        // Redraw twice a minute so "fetched … ago" in the status bar stays current.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(30))
+                .await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        })
+        .detach();
         let connections = engine.connections();
+        let home = home::HomeState::new(window, cx);
         Self {
             engine,
             focus: cx.focus_handle(),
@@ -169,6 +255,7 @@ impl ThaanApp {
             conn_url,
             conn_params,
             conn_read_only: false,
+            connecting: false,
             connections,
             session: None,
             objects: Vec::new(),
@@ -180,6 +267,7 @@ impl ThaanApp {
             palette_open: false,
             palette_input,
             status: None,
+            home,
         }
     }
 
@@ -267,17 +355,68 @@ impl ThaanApp {
         Ok(c)
     }
 
+    /// Connects on a background thread: an unreachable host can take until the driver's
+    /// timeout, and the window must stay responsive meanwhile.
     fn connect(&mut self, c: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
-        match self.engine.open(c) {
-            Ok(info) => {
-                self.session = Some(info);
-                self.tabs.clear();
-                self.refresh_schema(cx);
-                self.new_query_tab(None, window, cx);
-                self.set_status("Connected", false, cx);
-            }
-            Err(e) => self.set_status(format!("Connection failed: {e}"), true, cx),
+        if self.connecting {
+            return;
         }
+        self.connecting = true;
+        self.set_status(format!("Connecting to {}…", c.name), false, cx);
+        let engine = self.engine.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    let info = engine.open(c)?;
+                    // Load the schema here too, so a large database does not stall the UI.
+                    let objects = engine.list_objects(info.session_id).unwrap_or_default();
+                    Ok::<_, thaan_core::Error>((info, objects))
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.connecting = false;
+                match res {
+                    Ok((info, objects)) => {
+                        this.session = Some(info);
+                        this.objects = objects;
+                        this.tabs.clear();
+                        this.new_query_tab(None, window, cx);
+                        this.set_status("Connected", false, cx);
+                    }
+                    Err(e) => this.set_status(format!("Connection failed: {e}"), true, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn test_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connecting {
+            return;
+        }
+        let c = match self.form_config(cx) {
+            Ok(c) => c,
+            Err(e) => return self.set_status(e, true, cx),
+        };
+        self.connecting = true;
+        self.set_status(format!("Testing {}…", c.name), false, cx);
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx
+                .background_spawn(async move { engine.test_connection(&c) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.connecting = false;
+                if r.ok {
+                    this.set_status(format!("Connection OK ({} ms)", r.elapsed_ms), false, cx);
+                } else {
+                    this.set_status(r.error.unwrap_or_default(), true, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
@@ -293,14 +432,36 @@ impl ThaanApp {
 
     fn refresh_schema(&mut self, cx: &mut Context<Self>) {
         let Some(s) = &self.session else { return };
-        match self.engine.list_objects(s.session_id) {
-            Ok(o) => self.objects = o,
-            Err(e) => self.set_status(format!("Schema: {e}"), true, cx),
-        }
-        cx.notify();
+        let sid = s.session_id;
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.list_objects(sid) })
+                .await;
+            this.update(cx, |this, cx| {
+                // Ignore results for a session that was closed meanwhile.
+                if this.session.as_ref().map(|s| s.session_id) != Some(sid) {
+                    return;
+                }
+                match res {
+                    Ok(o) => this.objects = o,
+                    Err(e) => this.set_status(format!("Schema: {e}"), true, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- tabs -------------------------------------------------------------------------
+
+    /// A tree / JSON panel; the app re-renders when its view mode changes.
+    fn new_doc_panel(window: &mut Window, cx: &mut Context<Self>) -> Entity<DocPanel> {
+        let panel = cx.new(|cx| DocPanel::new(window, cx));
+        cx.observe(&panel, |_, _, cx| cx.notify()).detach();
+        panel
+    }
 
     fn new_grid(window: &mut Window, cx: &mut Context<Self>) -> Entity<TableState<ResultGrid>> {
         cx.new(|cx| {
@@ -332,6 +493,7 @@ impl ThaanApp {
             }
         };
         let grid = Self::new_grid(window, cx);
+        let docs = Self::new_doc_panel(window, cx);
         self.tabs.push(Tab::Query(QueryTab {
             title,
             saved_id,
@@ -339,6 +501,7 @@ impl ThaanApp {
             results: Vec::new(),
             active_result: 0,
             grid,
+            docs,
             running: false,
         }));
         self.active = self.tabs.len() - 1;
@@ -375,20 +538,193 @@ impl ThaanApp {
             .session
             .as_ref()
             .and_then(|s| self.engine.describe_table(s.session_id, &object).ok());
+        // The builder needs column names; without them (or on MongoDB) only the raw box works.
+        let builder = !self.is_mongo() && info.as_ref().is_some_and(|i| !i.columns.is_empty());
+        let first_row = info
+            .as_ref()
+            .filter(|_| builder)
+            .map(|i| Self::new_filter_row(0, i, window, cx));
+        let page_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(
+            &page_input,
+            window,
+            |this, input, ev: &InputEvent, _, cx| {
+                if !matches!(ev, InputEvent::PressEnter { .. }) {
+                    return;
+                }
+                let typed = input.read(cx).value().trim().parse::<u64>().ok();
+                if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                    let pages = t.page.as_ref().map_or(1, |p| p.page_count());
+                    if let Some(n) = typed {
+                        t.page_ix = n.clamp(1, pages) - 1;
+                    }
+                }
+                this.load_page(cx);
+            },
+        )
+        .detach();
+        // Table tabs sort on the server, so the order covers every page, not just this one.
+        let grid = Self::new_grid(window, cx);
+        let weak = cx.entity().downgrade();
+        let sort_object = object.clone();
+        let table_info = info.clone();
+        grid.update(cx, |g, _| {
+            let d = g.delegate_mut();
+            if let Some(i) = &table_info {
+                d.set_table_info(i);
+            }
+            d.set_server_sort(Box::new(move |column, sort, _, cx| {
+                let weak = weak.clone();
+                let object = sort_object.clone();
+                // Deferred: this runs inside the grid's own update.
+                cx.defer(move |cx| {
+                    weak.update(cx, |app, cx| app.sort_table(&object, column, sort, cx))
+                        .ok();
+                });
+            }));
+        });
+        let docs = Self::new_doc_panel(window, cx);
+        let projection = cx.new(|cx| InputState::new(window, cx).placeholder("{ field: 1 }"));
+        let sort_doc = cx.new(|cx| InputState::new(window, cx).placeholder("{ field: -1 }"));
+        for input in [&projection, &sort_doc] {
+            cx.subscribe_in(input, window, |this, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                        t.page_ix = 0;
+                    }
+                    this.load_page(cx);
+                }
+            })
+            .detach();
+        }
         self.tabs.push(Tab::Table(Box::new(TableTab {
             object,
             info,
             ddl: None,
             filter,
+            filter_rows: first_row.into_iter().collect(),
+            next_filter_id: 1,
+            raw_mode: !builder,
+            page_input,
+            fetched_at: None,
             page: None,
             page_ix: 0,
             sort: Vec::new(),
             view: TableView::Data,
-            grid: Self::new_grid(window, cx),
+            grid,
+            docs,
+            projection,
+            sort_doc,
             error: None,
             loading: false,
         })));
         self.active = self.tabs.len() - 1;
+        self.load_page(cx);
+    }
+
+    /// Header click on a table tab: refetch page 1 sorted by `column` on the server.
+    fn sort_table(
+        &mut self,
+        object: &ObjectRef,
+        column: String,
+        sort: ColumnSort,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Table(tt) if &tt.object == object))
+        else {
+            return;
+        };
+        if let Some(Tab::Table(t)) = self.tabs.get_mut(ix) {
+            t.sort = match sort {
+                ColumnSort::Ascending => vec![Sort {
+                    column,
+                    descending: false,
+                }],
+                ColumnSort::Descending => vec![Sort {
+                    column,
+                    descending: true,
+                }],
+                _ => Vec::new(),
+            };
+            t.page_ix = 0;
+        }
+        // `load_page` fetches the active tab; a header click always comes from it.
+        if ix == self.active {
+            self.load_page(cx);
+        }
+    }
+
+    fn new_filter_row(
+        id: usize,
+        info: &TableInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FilterRow {
+        let columns: Vec<SharedString> = info
+            .columns
+            .iter()
+            .map(|c| SharedString::from(c.name.clone()))
+            .collect();
+        let ops: Vec<SharedString> = FilterOp::PICKER
+            .iter()
+            .map(|o| SharedString::from(o.title()))
+            .collect();
+        let column = cx.new(|cx| {
+            SelectState::new(columns, Some(IndexPath::new(0)), window, cx).searchable(true)
+        });
+        let op = cx.new(|cx| SelectState::new(ops, Some(IndexPath::new(0)), window, cx));
+        let value = cx.new(|cx| InputState::new(window, cx).placeholder("Value"));
+        // Changing the operator can hide or show the value box.
+        cx.subscribe_in(
+            &op,
+            window,
+            |_, _, _: &SelectEvent<Vec<SharedString>>, _, cx| cx.notify(),
+        )
+        .detach();
+        cx.subscribe_in(&value, window, |this, _, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.apply_filter(cx);
+            }
+        })
+        .detach();
+        FilterRow {
+            id,
+            column,
+            op,
+            value,
+        }
+    }
+
+    fn add_filter_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(info) = t.info.clone() else { return };
+        let id = t.next_filter_id;
+        t.next_filter_id += 1;
+        let row = Self::new_filter_row(id, &info, window, cx);
+        if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
+            row.value.update(cx, |v, cx| v.focus(window, cx));
+            t.filter_rows.push(row);
+        }
+        cx.notify();
+    }
+
+    fn remove_filter_row(&mut self, id: usize, cx: &mut Context<Self>) {
+        if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
+            t.filter_rows.retain(|r| r.id != id);
+        }
+        self.apply_filter(cx);
+    }
+
+    /// Re-fetches from page 1 with the current filter.
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {
+        if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
+            t.page_ix = 0;
+        }
         self.load_page(cx);
     }
 
@@ -460,6 +796,8 @@ impl ThaanApp {
                             .get(q.active_result)
                             .and_then(|r| r.result.clone())
                             .unwrap_or_default();
+                        let documents = rs.documents.clone().unwrap_or_default();
+                        q.docs.update(cx, |p, cx| p.set_docs(documents, cx));
                         q.grid.update(cx, |g, cx| {
                             g.delegate_mut().set(rs);
                             g.refresh(cx);
@@ -488,6 +826,8 @@ impl ThaanApp {
                 .get(i)
                 .and_then(|r| r.result.clone())
                 .unwrap_or_default();
+            let documents = rs.documents.clone().unwrap_or_default();
+            q.docs.update(cx, |p, cx| p.set_docs(documents, cx));
             q.grid.update(cx, |g, cx| {
                 g.delegate_mut().set(rs);
                 g.refresh(cx);
@@ -503,11 +843,14 @@ impl ThaanApp {
         let Some(Tab::Table(t)) = self.tabs.get_mut(ix) else {
             return;
         };
-        let raw = t.filter.read(cx).value().trim().to_string();
+        let (filters, raw_where) = t.where_parts(cx);
+        let (projection, raw_sort) = t.document_shape(cx);
         let req = PageRequest {
             table: t.object.clone(),
-            filters: vec![],
-            raw_where: (!raw.is_empty()).then_some(raw),
+            filters,
+            raw_where,
+            projection,
+            raw_sort,
             sort: t.sort.clone(),
             page: t.page_ix,
             page_size: 100,
@@ -527,9 +870,14 @@ impl ThaanApp {
                 match res {
                     Ok(page) => {
                         t.error = None;
+                        t.fetched_at = Some(std::time::Instant::now());
                         let rs = page.result.clone();
+                        let offset = page.page * page.page_size;
                         t.page = Some(page);
+                        let documents = rs.documents.clone().unwrap_or_default();
+                        t.docs.update(cx, |p, cx| p.set_docs(documents, cx));
                         t.grid.update(cx, |g, cx| {
+                            g.delegate_mut().set_row_offset(offset);
                             g.delegate_mut().set(rs);
                             g.refresh(cx);
                         });
@@ -580,11 +928,14 @@ impl ThaanApp {
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return;
         };
-        let raw = t.filter.read(cx).value().trim().to_string();
+        let (filters, raw_where) = t.where_parts(cx);
+        let (projection, raw_sort) = t.document_shape(cx);
         let req = PageRequest {
             table: t.object.clone(),
-            filters: vec![],
-            raw_where: (!raw.is_empty()).then_some(raw),
+            filters,
+            raw_where,
+            projection,
+            raw_sort,
             sort: t.sort.clone(),
             page: 0,
             page_size: 100,
@@ -702,196 +1053,6 @@ fn summarize(results: &[StatementResult]) -> String {
 // ---- rendering ------------------------------------------------------------------------
 
 impl ThaanApp {
-    fn render_connect(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let saved = self.connections.clone();
-        let form =
-            v_flex()
-                .gap_4()
-                .w(px(440.))
-                .p_6()
-                .rounded(px(12.))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.sidebar)
-                .child(div().text_lg().font_medium().child("New connection"))
-                .child(
-                    h_flex().gap_1().flex_wrap().children(self.drivers.iter().enumerate().map(
-                        |(i, d)| {
-                            Button::new(("driver", i))
-                                .small()
-                                .label(d.name.clone())
-                                .selected(d.id == self.driver.id)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_driver(i, window, cx)
-                                }))
-                        },
-                    )),
-                )
-                .child(field(
-                    "Name",
-                    Input::new(&self.conn_name).into_any_element(),
-                    &theme,
-                ))
-                .child(field(
-                    "Connection URL",
-                    Input::new(&self.conn_url).into_any_element(),
-                    &theme,
-                ))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("Or fill in the {} fields", self.driver.name)),
-                )
-                .children(self.driver.params.iter().zip(&self.conn_params).map(
-                    |(spec, (_, _, st))| {
-                        field(&spec.label, Input::new(st).into_any_element(), &theme)
-                    },
-                ))
-                .child(
-                    Checkbox::new("ro")
-                        .label("Read-only, refuse writes")
-                        .checked(self.conn_read_only)
-                        .on_click(cx.listener(|this, v: &bool, _, cx| {
-                            this.conn_read_only = *v;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .mt_2()
-                        .pt_4()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .gap_2()
-                        .justify_end()
-                        .child(Button::new("test").label("Test").on_click(cx.listener(
-                            |this, _, _, cx| match this.form_config(cx) {
-                                Ok(c) => {
-                                    let r = this.engine.test_connection(&c);
-                                    if r.ok {
-                                        this.set_status(
-                                            format!("Connection OK ({} ms)", r.elapsed_ms),
-                                            false,
-                                            cx,
-                                        );
-                                    } else {
-                                        this.set_status(r.error.unwrap_or_default(), true, cx);
-                                    }
-                                }
-                                Err(e) => this.set_status(e, true, cx),
-                            },
-                        )))
-                        .child(Button::new("save").label("Save").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                match this.form_config(cx).map_err(|e| e.to_string()).and_then(
-                                    |c| this.engine.save_connection(c).map_err(|e| e.to_string()),
-                                ) {
-                                    Ok(c) => {
-                                        this.connections = this.engine.connections();
-                                        this.set_status(format!("Saved “{}”", c.name), false, cx);
-                                    }
-                                    Err(e) => this.set_status(e, true, cx),
-                                }
-                            },
-                        )))
-                        .child(Button::new("connect").primary().label("Connect").on_click(
-                            cx.listener(|this, _, window, cx| match this.form_config(cx) {
-                                Ok(c) => this.connect(c, window, cx),
-                                Err(e) => this.set_status(e, true, cx),
-                            }),
-                        )),
-                );
-
-        let count = saved.len();
-        let list = v_flex()
-            .w(px(280.))
-            .pt_6()
-            .gap_0p5()
-            .child(
-                group_label("Saved connections", (count > 0).then_some(count), &theme)
-                    .px_2()
-                    .pb_2(),
-            )
-            .when(saved.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("None yet. Fill in the form and press Save."),
-                )
-            })
-            .children(saved.into_iter().enumerate().map(|(i, c)| {
-                let color = c
-                    .color
-                    .as_deref()
-                    .and_then(parse_hex)
-                    .unwrap_or(theme.primary);
-                let subtitle = c
-                    .param("path")
-                    .or(c.param("host"))
-                    .unwrap_or("")
-                    .to_string();
-                let id = c.id.clone();
-                h_flex()
-                    .id(("conn", i))
-                    .gap_3()
-                    .px_2()
-                    .py_2()
-                    .rounded(px(8.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .child(conn_dot(color))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .overflow_hidden()
-                            .gap_0p5()
-                            .child(div().text_sm().font_medium().child(c.name.clone()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .truncate()
-                                    .child(format!("{} · {subtitle}", c.driver)),
-                            ),
-                    )
-                    .when(c.read_only, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Read-only"),
-                        )
-                    })
-                    .child(
-                        Button::new(("del", i))
-                            .ghost()
-                            .xsmall()
-                            .icon(icon("trash"))
-                            .tooltip("Delete")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.engine.delete_connection(&id).ok();
-                                this.connections = this.engine.connections();
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.connect(c.clone(), window, cx)),
-                    )
-            }));
-
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.background)
-            .child(h_flex().gap_12().items_start().child(list).child(form))
-    }
-
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let mongo = self.is_mongo();
         let theme = cx.theme().clone();
@@ -971,13 +1132,17 @@ impl ThaanApp {
                 for (gi, (kind, items)) in groups.into_iter().enumerate() {
                     tree = tree.child(
                         group_label(
-                            if mongo && kind == ObjectKind::Table { "Collections" } else { kind.label_plural() },
+                            if mongo && kind == ObjectKind::Table {
+                                "Collections"
+                            } else {
+                                kind.label_plural()
+                            },
                             Some(items.len()),
                             &theme,
                         )
-                            .px_2()
-                            .pt(px(if gi == 0 { 4. } else { 16. }))
-                            .pb_1(),
+                        .px_2()
+                        .pt(px(if gi == 0 { 4. } else { 16. }))
+                        .pb_1(),
                     );
                     let ic = match kind {
                         ObjectKind::Table => "table",
@@ -1384,11 +1549,21 @@ impl ThaanApp {
                 ),
                 &theme,
             ),
+            Some(r)
+                if r.result.as_ref().is_some_and(|rs| rs.documents.is_some())
+                    && q.docs.read(cx).view() != DocView::Table =>
+            {
+                q.docs.clone().into_any_element()
+            }
             Some(_) => DataTable::new(&q.grid)
                 .stripe(true)
                 .bordered(false)
                 .into_any_element(),
         };
+        let doc_switch = active
+            .and_then(|r| r.result.as_ref())
+            .is_some_and(|rs| rs.documents.is_some())
+            .then(|| view_switch(&q.docs, cx));
 
         v_resizable("query-split")
             .child(
@@ -1415,6 +1590,7 @@ impl ThaanApp {
                                 .bg(theme.sidebar)
                                 .child(result_tabs)
                                 .child(div().flex_1())
+                                .children(doc_switch)
                                 .child(self.render_results_toolbar(cx)),
                         )
                         .child(div().flex_1().overflow_hidden().child(body)),
@@ -1424,11 +1600,15 @@ impl ThaanApp {
     }
 
     fn render_table_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mongo = self.is_mongo();
         let theme = cx.theme().clone();
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return div().into_any_element();
         };
         let view = t.view;
+        let raw_mode = t.raw_mode;
+        // Rows exist only when the builder can work (known columns, not MongoDB).
+        let can_build = !t.filter_rows.is_empty();
         let seg = |id: &'static str, label: &'static str, v: TableView, cx: &mut Context<Self>| {
             Button::new(id)
                 .xsmall()
@@ -1455,101 +1635,155 @@ impl ThaanApp {
             .border_color(theme.border)
             .child(seg("v-data", "Data", TableView::Data, cx))
             .child(seg("v-struct", "Structure", TableView::Structure, cx))
-            .when(view == TableView::Data, |d| {
-                d.child(div().flex_1().child(Input::new(&t.filter).small()))
-                    .child(
-                        Button::new("apply-filter")
-                            .small()
-                            .label("Apply")
-                            .tooltip("Apply the WHERE clause (↵)")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
-                                    t.page_ix = 0;
-                                }
-                                this.load_page(cx);
-                            })),
-                    )
-            })
-            .when(view == TableView::Structure, |d| d.child(div().flex_1()));
+            .child(div().flex_1())
+            .when(view == TableView::Data && can_build, |d| {
+                d.child(
+                    Button::new("filter-mode")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon(if raw_mode {
+                            "list-filter"
+                        } else {
+                            "square-code"
+                        }))
+                        .label(if raw_mode {
+                            "Filter builder"
+                        } else {
+                            "WHERE clause"
+                        })
+                        .tooltip(if raw_mode {
+                            "Filter by column, operator and value"
+                        } else {
+                            "Type a raw WHERE clause"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                                t.raw_mode = !t.raw_mode;
+                            }
+                            this.apply_filter(cx);
+                        })),
+                )
+            });
+
+        const APPLY_W: f32 = 64.;
+        let apply = |cx: &mut Context<Self>| {
+            Button::new("apply-filter")
+                .small()
+                .w(px(APPLY_W))
+                .label("Apply")
+                .tooltip("Apply the filter (↵)")
+                .on_click(cx.listener(|this, _, _, cx| this.apply_filter(cx)))
+        };
+        let filter_bar: Option<AnyElement> = (view == TableView::Data).then(|| {
+            if mongo {
+                // MongoDB: filter, projection and sort documents (docs/spec/mongodb-ui.md M6).
+                let labelled = |label: &'static str, input: &Entity<InputState>, grow: f32| {
+                    h_flex()
+                        .flex_grow(grow)
+                        .flex_basis(px(0.))
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(label))
+                        .child(div().flex_1().min_w_0().child(Input::new(input).small()))
+                };
+                h_flex()
+                    .h(px(40.))
+                    .px_2()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(labelled("Filter", &t.filter, 0.5))
+                    .child(labelled("Projection", &t.projection, 0.25))
+                    .child(labelled("Sort", &t.sort_doc, 0.25))
+                    .child(apply(cx))
+                    .child(view_switch(&t.docs, cx))
+                    .into_any_element()
+            } else if raw_mode {
+                h_flex()
+                    .h(px(40.))
+                    .px_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().flex_1().child(Input::new(&t.filter).small()))
+                    .child(apply(cx))
+                    .into_any_element()
+            } else {
+                let last = t.filter_rows.len().saturating_sub(1);
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .children(t.filter_rows.iter().enumerate().map(|(i, r)| {
+                        let id = r.id;
+                        let needs_value =
+                            r.op.read(cx)
+                                .selected_value()
+                                .and_then(|l| FilterOp::from_title(l))
+                                .is_none_or(FilterOp::needs_value);
+                        h_flex()
+                            .h(px(32.))
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(40.))
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if i == 0 { "Where" } else { "and" }),
+                            )
+                            // The select fills its parent, so fixed-width boxes set the width.
+                            .child(
+                                div()
+                                    .w(px(200.))
+                                    .flex_none()
+                                    .child(Select::new(&r.column).small()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(176.))
+                                    .flex_none()
+                                    .child(Select::new(&r.op).small()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .when(needs_value, |d| d.child(Input::new(&r.value).small())),
+                            )
+                            .child(div().w(px(24.)).when(t.filter_rows.len() > 1, |d| {
+                                d.child(
+                                    Button::new(("filter-del", id))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(icon("minus"))
+                                        .tooltip("Remove this condition")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.remove_filter_row(id, cx)
+                                        })),
+                                )
+                            }))
+                            .child(div().w(px(24.)).when(i == last, |d| {
+                                d.child(
+                                    Button::new("filter-add")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(icon("plus"))
+                                        .tooltip("Add a condition")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.add_filter_row(window, cx)
+                                        })),
+                                )
+                            }))
+                            .child(div().w(px(APPLY_W)).when(i == 0, |d| d.child(apply(cx))))
+                    }))
+                    .into_any_element()
+            }
+        });
 
         let body: AnyElement = match view {
             TableView::Data => {
-                let pager = t
-                    .page
-                    .as_ref()
-                    .map(|p| (p.page, p.page_count(), p.total_rows, p.result.elapsed_ms));
-                let mono = theme.mono_font_family.clone();
-                let footer = h_flex()
-                    .h(px(36.))
-                    .px_2()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .when_some(pager, |d, (page, pages, total, ms)| {
-                        d.child(
-                            Button::new("prev")
-                                .ghost()
-                                .xsmall()
-                                .icon(icon("chevron-left"))
-                                .disabled(page == 0)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
-                                        t.page_ix = t.page_ix.saturating_sub(1);
-                                    }
-                                    this.load_page(cx);
-                                })),
-                        )
-                        .child(div().font_family(mono.clone()).child(format!(
-                            "{} / {}",
-                            page + 1,
-                            pages
-                        )))
-                        .child(
-                            Button::new("next")
-                                .ghost()
-                                .xsmall()
-                                .icon(icon("chevron-right"))
-                                .disabled(page + 1 >= pages)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
-                                        t.page_ix += 1;
-                                    }
-                                    this.load_page(cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .pl_2()
-                                .font_family(mono.clone())
-                                .child(format!("{} · {ms} ms", plural(total, "row"))),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(div().pr_1().child("Export"))
-                    .child(
-                        Button::new("export-csv")
-                            .ghost()
-                            .xsmall()
-                            .label("CSV")
-                            .tooltip("Whole table, with filter, to ~/Downloads")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_table_to_file(ExportFormat::Csv, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("export-json")
-                            .ghost()
-                            .xsmall()
-                            .label("JSON")
-                            .tooltip("Whole table, with filter, to ~/Downloads")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_table_to_file(ExportFormat::Json, cx)
-                            })),
-                    )
-                    .child(div().mx_2().w(px(1.)).h(px(16.)).bg(theme.border))
-                    .child(self.render_results_toolbar(cx));
                 let grid: AnyElement = match &t.error {
                     Some(e) => div()
                         .p_4()
@@ -1557,6 +1791,9 @@ impl ThaanApp {
                         .text_color(theme.danger)
                         .child(e.clone())
                         .into_any_element(),
+                    None if mongo && t.docs.read(cx).view() != DocView::Table => {
+                        t.docs.clone().into_any_element()
+                    }
                     None => DataTable::new(&t.grid)
                         .stripe(true)
                         .bordered(false)
@@ -1565,7 +1802,6 @@ impl ThaanApp {
                 v_flex()
                     .size_full()
                     .child(div().flex_1().overflow_hidden().child(grid))
-                    .child(footer)
                     .into_any_element()
             }
             TableView::Structure => {
@@ -1677,8 +1913,197 @@ impl ThaanApp {
         v_flex()
             .size_full()
             .child(header)
+            .children(filter_bar)
             .child(div().flex_1().overflow_hidden().child(body))
             .into_any_element()
+    }
+
+    /// The one bar at the bottom: facts about the active tab on the left, paging and
+    /// export on the right (docs/spec/workspace.md §5).
+    fn render_status(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mono = theme.mono_font_family.clone();
+        let table = match self.tabs.get(self.active) {
+            Some(Tab::Table(t)) if t.view == TableView::Data && self.session.is_some() => Some(t),
+            _ => None,
+        };
+
+        // Keep the page box showing the current page unless the user is typing in it.
+        if let Some(t) = table {
+            if let Some(p) = &t.page {
+                let shown = (p.page + 1).to_string();
+                let input = t.page_input.clone();
+                if !input.read(cx).focus_handle(cx).is_focused(window)
+                    && input.read(cx).value() != shown.as_str()
+                {
+                    input.update(cx, |s, cx| s.set_value(shown, window, cx));
+                }
+            }
+        }
+
+        let facts: Option<String> = table.and_then(|t| {
+            let p = t.page.as_ref()?;
+            let ago = t.fetched_at.map(|at| {
+                let s = at.elapsed().as_secs();
+                match s {
+                    0..=29 => "fetched just now".to_string(),
+                    30..=89 => "fetched 1 min ago".to_string(),
+                    _ if s < 3600 => format!("fetched {} min ago", (s + 30) / 60),
+                    _ => format!("fetched {} h ago", s / 3600),
+                }
+            });
+            let mut out = if p.result.documents.is_some() {
+                // MongoDB wording (docs/spec/mongodb-ui.md M7).
+                let first = p.page * p.page_size;
+                let shown = p.result.rows.len() as u64;
+                if shown == 0 {
+                    format!("No documents · {} ms", p.result.elapsed_ms)
+                } else {
+                    format!(
+                        "Documents {}–{} of {} · {} ms",
+                        first + 1,
+                        first + shown,
+                        p.total_rows,
+                        p.result.elapsed_ms
+                    )
+                }
+            } else {
+                format!("{} · {} ms", plural(p.total_rows, "row"), p.result.elapsed_ms)
+            };
+            if let Some(a) = ago {
+                out.push_str(" · ");
+                out.push_str(&a);
+            }
+            Some(out)
+        });
+        let (msg, err) = match self.status.clone() {
+            Some((m, e)) => (Some(m), e),
+            None => (None, false),
+        };
+
+        let mut bar = h_flex()
+            .h(px(32.))
+            .flex_none()
+            .px_3()
+            .gap_3()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .bg(theme.status_bar)
+            .border_t_1()
+            .border_color(theme.status_bar_border);
+
+        // An error replaces the facts; other messages sit after them.
+        if err {
+            bar = bar.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.danger)
+                    .child(msg.unwrap_or_default()),
+            );
+        } else {
+            bar = bar
+                .when_some(facts, |d, f| {
+                    d.child(div().flex_none().font_family(mono.clone()).child(f))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when_some(msg, |d, m| d.child(m)),
+                );
+        }
+
+        let Some(t) = table else {
+            return bar.into_any_element();
+        };
+        let Some((page, pages)) = t.page.as_ref().map(|p| (p.page, p.page_count())) else {
+            return bar.into_any_element();
+        };
+        let weak = cx.entity().downgrade();
+        let export = Button::new("export-menu")
+            .ghost()
+            .xsmall()
+            .icon(icon("download"))
+            .label("Export")
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                let item = |label: &'static str, f: fn(&mut ThaanApp, &mut Context<ThaanApp>)| {
+                    let weak = weak.clone();
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        weak.update(cx, f).ok();
+                    })
+                };
+                menu.label("Whole table to ~/Downloads")
+                    .item(item("CSV file", |a, cx| {
+                        a.export_table_to_file(ExportFormat::Csv, cx)
+                    }))
+                    .item(item("JSON file", |a, cx| {
+                        a.export_table_to_file(ExportFormat::Json, cx)
+                    }))
+                    .separator()
+                    .label("This page to the clipboard")
+                    .item(item("CSV", |a, cx| a.copy_result(ExportFormat::Csv, cx)))
+                    .item(item("JSON", |a, cx| a.copy_result(ExportFormat::Json, cx)))
+                    .item(item("Markdown", |a, cx| {
+                        a.copy_result(ExportFormat::Markdown, cx)
+                    }))
+                    .item(item("SQL INSERT", |a, cx| {
+                        a.copy_result(ExportFormat::SqlInsert, cx)
+                    }))
+            });
+
+        bar.child(
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .child(
+                    Button::new("prev")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("chevron-left"))
+                        .tooltip("Previous page")
+                        .disabled(page == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                                t.page_ix = t.page_ix.saturating_sub(1);
+                            }
+                            this.load_page(cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(48.))
+                        .child(Input::new(&t.page_input).xsmall().text_center()),
+                )
+                .child(div().font_family(mono).child(format!("of {pages}")))
+                .child(
+                    Button::new("next")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("chevron-right"))
+                        .tooltip("Next page")
+                        .disabled(page + 1 >= pages)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                                t.page_ix += 1;
+                            }
+                            this.load_page(cx);
+                        })),
+                )
+                .child(div().mx_1().w(px(1.)).h(px(16.)).bg(theme.border))
+                .child(
+                    Button::new("refresh-page")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon("refresh-cw"))
+                        .tooltip("Fetch this page again")
+                        .on_click(cx.listener(|this, _, _, cx| this.load_page(cx))),
+                )
+                .child(export),
+        )
+        .into_any_element()
     }
 
     fn render_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1834,28 +2259,10 @@ impl Render for ThaanApp {
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
             );
 
-        let status = h_flex()
-            .h(px(24.))
-            .px_3()
-            .text_xs()
-            .bg(theme.status_bar)
-            .border_t_1()
-            .border_color(theme.status_bar_border)
-            .when_some(self.status.clone(), |d, (msg, err)| {
-                d.child(
-                    div()
-                        .truncate()
-                        .text_color(if err {
-                            theme.danger
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(msg),
-                )
-            });
+        let status = self.render_status(window, cx);
 
         let main: AnyElement = if self.session.is_none() {
-            self.render_connect(window, cx).into_any_element()
+            self.render_home(cx)
         } else {
             let content = if self.tabs.is_empty() {
                 empty_state(
@@ -1888,6 +2295,7 @@ impl Render for ThaanApp {
         root.child(header)
             .child(div().flex_1().overflow_hidden().child(main))
             .child(status)
+            .children(self.render_conn_dialog(cx))
             .when(self.palette_open, |d| d.child(self.render_palette(cx)))
     }
 }

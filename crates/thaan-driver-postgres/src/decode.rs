@@ -1,37 +1,65 @@
 //! Decoding of PostgreSQL binary-format values ("send" functions of each type), from
 //! the type documentation. Unknown types fall back to UTF-8 text or hex.
 
-use thaan_core::Value;
 use postgres::types::{Kind, Type};
+use thaan_core::Value;
 
 /// Days from 1970-01-01 to 2000-01-01 (the PostgreSQL epoch).
 const PG_EPOCH_DAYS: i64 = 10_957;
 
 pub fn value(ty: &Type, raw: &[u8]) -> Value {
     match ty.kind() {
-        Kind::Array(elem) => return array(elem, raw).map(Value::Text).unwrap_or_else(|| fallback(raw)),
+        Kind::Array(elem) => {
+            return array(elem, raw)
+                .map(Value::Text)
+                .unwrap_or_else(|| fallback(raw))
+        }
         Kind::Domain(base) => return value(base, raw),
         Kind::Enum(_) => return Value::Text(String::from_utf8_lossy(raw).into_owned()),
         _ => {}
     }
     match *ty {
         Type::BOOL => Value::Bool(raw.first().is_some_and(|b| *b != 0)),
-        Type::INT2 => be::<2>(raw).map(|b| Value::Int(i16::from_be_bytes(b) as i64)).unwrap_or_else(|| fallback(raw)),
-        Type::INT4 => be::<4>(raw).map(|b| Value::Int(i32::from_be_bytes(b) as i64)).unwrap_or_else(|| fallback(raw)),
-        Type::INT8 => be::<8>(raw).map(|b| Value::Int(i64::from_be_bytes(b))).unwrap_or_else(|| fallback(raw)),
+        Type::INT2 => be::<2>(raw)
+            .map(|b| Value::Int(i16::from_be_bytes(b) as i64))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::INT4 => be::<4>(raw)
+            .map(|b| Value::Int(i32::from_be_bytes(b) as i64))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::INT8 => be::<8>(raw)
+            .map(|b| Value::Int(i64::from_be_bytes(b)))
+            .unwrap_or_else(|| fallback(raw)),
         Type::OID | Type::XID | Type::CID | Type::REGCLASS | Type::REGPROC | Type::REGTYPE => {
-            be::<4>(raw).map(|b| Value::Int(u32::from_be_bytes(b) as i64)).unwrap_or_else(|| fallback(raw))
+            be::<4>(raw)
+                .map(|b| Value::Int(u32::from_be_bytes(b) as i64))
+                .unwrap_or_else(|| fallback(raw))
         }
-        Type::FLOAT4 => be::<4>(raw).map(|b| Value::Float(f32::from_be_bytes(b) as f64)).unwrap_or_else(|| fallback(raw)),
-        Type::FLOAT8 => be::<8>(raw).map(|b| Value::Float(f64::from_be_bytes(b))).unwrap_or_else(|| fallback(raw)),
-        Type::NUMERIC => numeric(raw).map(Value::Text).unwrap_or_else(|| fallback(raw)),
+        Type::FLOAT4 => be::<4>(raw)
+            .map(|b| Value::Float(f32::from_be_bytes(b) as f64))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::FLOAT8 => be::<8>(raw)
+            .map(|b| Value::Float(f64::from_be_bytes(b)))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::NUMERIC => numeric(raw)
+            .map(Value::Text)
+            .unwrap_or_else(|| fallback(raw)),
         Type::BYTEA => Value::Bytes(raw.to_vec()),
         Type::UUID if raw.len() == 16 => Value::Text(uuid(raw)),
-        Type::JSONB if raw.first() == Some(&1) => Value::Text(String::from_utf8_lossy(&raw[1..]).into_owned()),
-        Type::DATE => be::<4>(raw).map(|b| Value::Text(date(i32::from_be_bytes(b)))).unwrap_or_else(|| fallback(raw)),
-        Type::TIMESTAMP => be::<8>(raw).map(|b| Value::Text(timestamp(i64::from_be_bytes(b), false))).unwrap_or_else(|| fallback(raw)),
-        Type::TIMESTAMPTZ => be::<8>(raw).map(|b| Value::Text(timestamp(i64::from_be_bytes(b), true))).unwrap_or_else(|| fallback(raw)),
-        Type::TIME => be::<8>(raw).map(|b| Value::Text(time_of_day(i64::from_be_bytes(b)))).unwrap_or_else(|| fallback(raw)),
+        Type::JSONB if raw.first() == Some(&1) => {
+            Value::Text(String::from_utf8_lossy(&raw[1..]).into_owned())
+        }
+        Type::DATE => be::<4>(raw)
+            .map(|b| Value::Text(date(i32::from_be_bytes(b))))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::TIMESTAMP => be::<8>(raw)
+            .map(|b| Value::Text(timestamp(i64::from_be_bytes(b), false)))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::TIMESTAMPTZ => be::<8>(raw)
+            .map(|b| Value::Text(timestamp(i64::from_be_bytes(b), true)))
+            .unwrap_or_else(|| fallback(raw)),
+        Type::TIME => be::<8>(raw)
+            .map(|b| Value::Text(time_of_day(i64::from_be_bytes(b))))
+            .unwrap_or_else(|| fallback(raw)),
         Type::INTERVAL if raw.len() == 16 => {
             let us = i64::from_be_bytes(raw[0..8].try_into().unwrap_or_default());
             let days = i32::from_be_bytes(raw[8..12].try_into().unwrap_or_default());
@@ -56,7 +84,10 @@ fn fallback(raw: &[u8]) -> Value {
 
 /// Text of an array value, `{a,b,NULL}` style (one or more dimensions).
 fn array(elem: &Type, raw: &[u8]) -> Option<String> {
-    let rd_i32 = |p: usize| raw.get(p..p + 4).map(|b| i32::from_be_bytes(b.try_into().unwrap_or_default()));
+    let rd_i32 = |p: usize| {
+        raw.get(p..p + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap_or_default()))
+    };
     let ndim = rd_i32(0)? as usize;
     if ndim == 0 {
         return Some("{}".into());
@@ -79,8 +110,14 @@ fn array(elem: &Type, raw: &[u8]) -> Option<String> {
         pos += len as usize;
         let s = match value(elem, bytes) {
             Value::Text(s) => {
-                let needs = s.is_empty() || s.eq_ignore_ascii_case("null") || s.contains(|c: char| ",{}\"\\ ".contains(c));
-                if needs { format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")) } else { s }
+                let needs = s.is_empty()
+                    || s.eq_ignore_ascii_case("null")
+                    || s.contains(|c: char| ",{}\"\\ ".contains(c));
+                if needs {
+                    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                } else {
+                    s
+                }
             }
             other => other.to_string(),
         };
@@ -91,7 +128,10 @@ fn array(elem: &Type, raw: &[u8]) -> Option<String> {
             return format!("{{{}}}", items.join(","));
         }
         let chunk = items.len() / dims[0].max(1);
-        let parts: Vec<String> = items.chunks(chunk.max(1)).map(|c| nest(c, &dims[1..])).collect();
+        let parts: Vec<String> = items
+            .chunks(chunk.max(1))
+            .map(|c| nest(c, &dims[1..]))
+            .collect();
         format!("{{{}}}", parts.join(","))
     }
     Some(nest(&items, &dims))
@@ -114,7 +154,13 @@ pub fn numeric(raw: &[u8]) -> Option<String> {
     for i in 0..ndigits {
         digits.push(u16_at(8 + i * 2)?);
     }
-    let digit = |k: i64| if k >= 0 && (k as usize) < digits.len() { digits[k as usize] } else { 0 };
+    let digit = |k: i64| {
+        if k >= 0 && (k as usize) < digits.len() {
+            digits[k as usize]
+        } else {
+            0
+        }
+    };
     let mut s = String::new();
     if sign == 0x4000 {
         s.push('-');
@@ -147,9 +193,25 @@ pub fn numeric(raw: &[u8]) -> Option<String> {
     Some(s)
 }
 
+/// Lower-case hex of `b`, two digits a byte.
+pub(crate) fn hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    b.iter().fold(String::with_capacity(b.len() * 2), |mut s, x| {
+        let _ = write!(s, "{x:02x}"); // writing to a String cannot fail
+        s
+    })
+}
+
 fn uuid(b: &[u8]) -> String {
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    let h = hex(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Civil date from days since 1970-01-01 (proleptic Gregorian).
@@ -186,7 +248,12 @@ pub fn date(days: i32) -> String {
 pub fn time_of_day(us: i64) -> String {
     let secs = us.div_euclid(1_000_000);
     let frac = us.rem_euclid(1_000_000);
-    let mut s = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
+    let mut s = format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    );
     if frac > 0 {
         s.push_str(format!(".{frac:06}").trim_end_matches('0'));
     }
@@ -237,13 +304,23 @@ fn inet(raw: &[u8]) -> Option<String> {
     let text = match family {
         2 if len == 4 => format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]),
         3 if len == 16 => {
-            let segs: Vec<u16> = addr.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-            std::net::Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7]).to_string()
+            let segs: Vec<u16> = addr
+                .chunks(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            std::net::Ipv6Addr::new(
+                segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+            )
+            .to_string()
         }
         _ => return None,
     };
     let full = if family == 2 { 32 } else { 128 };
-    Some(if bits as u32 == full { text } else { format!("{text}/{bits}") })
+    Some(if bits as u32 == full {
+        text
+    } else {
+        format!("{text}/{bits}")
+    })
 }
 
 #[cfg(test)]
@@ -265,7 +342,10 @@ mod tests {
     #[test]
     fn numerics() {
         // 1234.5 with scale 3 → digits [1234, 5000], weight 0
-        assert_eq!(numeric(&num(&[1234, 5000], 0, 0x4000, 3)).unwrap(), "-1234.500");
+        assert_eq!(
+            numeric(&num(&[1234, 5000], 0, 0x4000, 3)).unwrap(),
+            "-1234.500"
+        );
         // 0.001 → digits [10], weight -1
         assert_eq!(numeric(&num(&[10], -1, 0, 3)).unwrap(), "0.001");
         // 12345678 → [1234, 5678], weight 1
@@ -284,14 +364,20 @@ mod tests {
         assert_eq!(timestamp(0, true), "2000-01-01 00:00:00+00");
         assert_eq!(timestamp(-1, false), "1999-12-31 23:59:59.999999");
         assert_eq!(time_of_day(49_501_250_000), "13:45:01.25");
-        assert_eq!(interval(14, 3, 3_600_000_000), "1 year 2 mons 3 days 01:00:00");
+        assert_eq!(
+            interval(14, 3, 3_600_000_000),
+            "1 year 2 mons 3 days 01:00:00"
+        );
         assert_eq!(interval(0, 0, 0), "00:00:00");
     }
 
     #[test]
     fn misc() {
         assert_eq!(
-            uuid(&[0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11]),
+            uuid(&[
+                0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38,
+                0x0a, 0x11
+            ]),
             "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
         );
         assert_eq!(inet(&[2, 24, 1, 4, 10, 0, 0, 0]).unwrap(), "10.0.0.0/24");

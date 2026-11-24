@@ -69,7 +69,7 @@ pub fn split(input: &str, opts: SplitOptions) -> Vec<Statement> {
 
         // DELIMITER command: whole line, only at line start (ignoring spaces).
         if opts.delimiter_command && at_line_start && !has_code {
-            let line_end = input[i..].find('\n').map(|p| i + p).unwrap_or(n);
+            let line_end = input[i..].find('\n').map_or(n, |p| i + p);
             let line = input[i..line_end].trim();
             if line.len() > 10
                 && line
@@ -105,16 +105,13 @@ pub fn split(input: &str, opts: SplitOptions) -> Vec<Statement> {
 
         match c {
             b'-' if i + 1 < n && b[i + 1] == b'-' => {
-                i = input[i..].find('\n').map(|p| i + p).unwrap_or(n);
+                i = input[i..].find('\n').map_or(n, |p| i + p);
             }
             b'#' if opts.hash_comments => {
-                i = input[i..].find('\n').map(|p| i + p).unwrap_or(n);
+                i = input[i..].find('\n').map_or(n, |p| i + p);
             }
             b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i = input[i + 2..]
-                    .find("*/")
-                    .map(|p| i + 2 + p + 2)
-                    .unwrap_or(n);
+                i = input[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
             }
             b'\'' | b'"' | b'`' => {
                 has_code = true;
@@ -122,17 +119,14 @@ pub fn split(input: &str, opts: SplitOptions) -> Vec<Statement> {
             }
             b'[' if opts.bracket_identifiers => {
                 has_code = true;
-                i = input[i..].find(']').map(|p| i + p + 1).unwrap_or(n);
+                i = input[i..].find(']').map_or(n, |p| i + p + 1);
             }
             b'$' if opts.dollar_quotes && (i == 0 || !is_ident_byte(b[i - 1])) => {
                 has_code = true;
                 match dollar_tag(input, i) {
                     Some(tag) => {
                         let body = i + tag.len();
-                        i = input[body..]
-                            .find(tag)
-                            .map(|p| body + p + tag.len())
-                            .unwrap_or(n);
+                        i = input[body..].find(tag).map_or(n, |p| body + p + tag.len());
                     }
                     None => i += 1,
                 }

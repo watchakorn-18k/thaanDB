@@ -26,8 +26,7 @@ impl Value {
             Value::Bool(b) => (*b).into(),
             Value::Int(i) => (*i).into(),
             Value::Float(f) => serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
             Value::Text(s) => s.clone().into(),
             Value::Bytes(b) => format!("0x{}", hex(b)).into(),
         }
@@ -49,7 +48,12 @@ impl Value {
 }
 
 pub(crate) fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    use std::fmt::Write;
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut s, x| {
+            let _ = write!(s, "{x:02x}"); // writing to a String cannot fail
+            s
+        })
 }
 
 impl fmt::Display for Value {

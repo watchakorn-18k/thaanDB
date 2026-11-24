@@ -59,13 +59,10 @@ fn scan(sql: &str) -> Vec<Hit> {
                 i += 1;
             }
             b'-' if b.get(i + 1) == Some(&b'-') => {
-                i = sql[i..].find('\n').map(|p| i + p).unwrap_or(b.len());
+                i = sql[i..].find('\n').map_or(b.len(), |p| i + p);
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
-                i = sql[i + 2..]
-                    .find("*/")
-                    .map(|p| i + 4 + p)
-                    .unwrap_or(b.len());
+                i = sql[i + 2..].find("*/").map_or(b.len(), |p| i + 4 + p);
             }
             b':' => {
                 let prev_colon = i > 0 && b[i - 1] == b':';

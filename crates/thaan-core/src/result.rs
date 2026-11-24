@@ -34,6 +34,9 @@ pub struct ResultSet {
     /// The statement that produced this result.
     #[serde(default)]
     pub sql: String,
+    /// Typed documents behind `rows`, for document databases (tree / JSON views).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<crate::doc::Doc>>,
 }
 
 impl ResultSet {

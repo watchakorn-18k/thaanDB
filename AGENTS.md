@@ -48,6 +48,9 @@ crates/
                        statement splitter, export, history, saved queries. No GUI, no I/O
                        beyond std::fs for the config store.
   thaan-driver-sqlite/ SQLite driver (rusqlite, `bundled` feature)
+  thaan-driver-postgres/ PostgreSQL (`postgres` crate; text-format params, binary decode)
+  thaan-driver-mysql/  MySQL / MariaDB (`mysql` crate, pure-Rust features)
+  thaan-driver-mongodb/ MongoDB (official crate, sync API; `shell.rs` parses shell syntax)
   thaan-cli/           `thaan` binary: headless access to every command
   thaan-app/           GPUI desktop app (gpui-component widgets)
 docs/
@@ -85,6 +88,20 @@ cargo fmt --all
 - Provide a `Dialect` (or reuse one) and the `DriverInfo` parameter schema.
 - Register it in `thaan-app` and `thaan-cli` behind a Cargo feature named after the driver.
 - Tests that need a live server are `#[ignore]` and read the URL from `THAAN_TEST_<NAME>_URL`.
+  Throwaway servers for them:
+
+  ```bash
+  docker run -d --name thaan-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:55432:5432 postgres:17-alpine
+  docker run -d --name thaan-test-mysql -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=thaan -p 127.0.0.1:33306:3306 mysql:8.4
+  docker run -d --name thaan-test-mongo -p 127.0.0.1:27018:27017 mongo:7
+  THAAN_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/postgres \
+  THAAN_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:33306/thaan \
+  THAAN_TEST_MONGODB_URL=mongodb://127.0.0.1:27018 \
+  cargo test --workspace --exclude thaan-app -- --include-ignored
+  ```
+- Non-SQL drivers set `Dialect::language` to something other than `Sql`; the engine then
+  passes editor text through untouched and uses the `Session` hooks (`fetch_page`,
+  `apply_changes`, `preview_changes`, `ping`) instead of generating SQL.
 
 ## Conventions
 

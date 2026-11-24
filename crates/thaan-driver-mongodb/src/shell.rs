@@ -25,21 +25,65 @@ pub enum Op {
         limit: Option<i64>,
         one: bool,
     },
-    Count { coll: String, filter: Document },
-    Distinct { coll: String, field: String, filter: Document },
-    Aggregate { coll: String, pipeline: Vec<Document> },
-    InsertOne { coll: String, doc: Document },
-    InsertMany { coll: String, docs: Vec<Document> },
-    Update { coll: String, filter: Document, update: UpdateSpec, many: bool, upsert: bool },
-    Replace { coll: String, filter: Document, doc: Document, upsert: bool },
-    Delete { coll: String, filter: Document, many: bool },
-    CreateIndex { coll: String, keys: Document, options: Document },
-    GetIndexes { coll: String },
-    DropCollection { coll: String },
-    CreateCollection { name: String, options: Document },
+    Count {
+        coll: String,
+        filter: Document,
+    },
+    Distinct {
+        coll: String,
+        field: String,
+        filter: Document,
+    },
+    Aggregate {
+        coll: String,
+        pipeline: Vec<Document>,
+    },
+    InsertOne {
+        coll: String,
+        doc: Document,
+    },
+    InsertMany {
+        coll: String,
+        docs: Vec<Document>,
+    },
+    Update {
+        coll: String,
+        filter: Document,
+        update: UpdateSpec,
+        many: bool,
+        upsert: bool,
+    },
+    Replace {
+        coll: String,
+        filter: Document,
+        doc: Document,
+        upsert: bool,
+    },
+    Delete {
+        coll: String,
+        filter: Document,
+        many: bool,
+    },
+    CreateIndex {
+        coll: String,
+        keys: Document,
+        options: Document,
+    },
+    GetIndexes {
+        coll: String,
+    },
+    DropCollection {
+        coll: String,
+    },
+    CreateCollection {
+        name: String,
+        options: Document,
+    },
     ListCollections,
     ListDatabases,
-    RunCommand { command: Document },
+    RunCommand {
+        command: Document,
+    },
 }
 
 /// An update is a document of operators or an aggregation pipeline.
@@ -51,9 +95,27 @@ pub enum UpdateSpec {
 
 /// Commands that only read, for `runCommand` on read-only connections.
 const READ_COMMANDS: &[&str] = &[
-    "ping", "buildinfo", "buildInfo", "serverStatus", "dbStats", "dbstats", "collStats", "collstats",
-    "listCollections", "listIndexes", "listDatabases", "count", "distinct", "find", "hello",
-    "isMaster", "ismaster", "hostInfo", "connectionStatus", "explain", "getParameter",
+    "ping",
+    "buildinfo",
+    "buildInfo",
+    "serverStatus",
+    "dbStats",
+    "dbstats",
+    "collStats",
+    "collstats",
+    "listCollections",
+    "listIndexes",
+    "listDatabases",
+    "count",
+    "distinct",
+    "find",
+    "hello",
+    "isMaster",
+    "ismaster",
+    "hostInfo",
+    "connectionStatus",
+    "explain",
+    "getParameter",
 ];
 
 impl Op {
@@ -174,7 +236,9 @@ impl<'a> P<'a> {
         let r = self.rest();
         let len = r
             .char_indices()
-            .take_while(|(n, c)| c.is_alphanumeric() || *c == '_' || *c == '$' || (*n > 0 && c.is_ascii_digit()))
+            .take_while(|(n, c)| {
+                c.is_alphanumeric() || *c == '_' || *c == '$' || (*n > 0 && c.is_ascii_digit())
+            })
             .map(|(n, c)| n + c.len_utf8())
             .last()?;
         if r.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -224,7 +288,11 @@ impl<'a> P<'a> {
         let r = self.rest();
         let len = r
             .char_indices()
-            .take_while(|(n, c)| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '_') || (matches!(c, '-' | '+') && (*n == 0 || r[..*n].ends_with(['e', 'E']))))
+            .take_while(|(n, c)| {
+                c.is_ascii_digit()
+                    || matches!(c, '.' | 'e' | 'E' | '_')
+                    || (matches!(c, '-' | '+') && (*n == 0 || r[..*n].ends_with(['e', 'E'])))
+            })
             .map(|(n, c)| n + c.len_utf8())
             .last()
             .unwrap_or(0);
@@ -294,14 +362,24 @@ impl<'a> P<'a> {
                         Some(c) => pattern.push(c),
                     }
                 }
-                let flags: String = std::iter::from_fn(|| self.peek().filter(|c| c.is_ascii_alphabetic()).and_then(|_| self.bump())).collect();
+                let flags: String = std::iter::from_fn(|| {
+                    self.peek()
+                        .filter(|c| c.is_ascii_alphabetic())
+                        .and_then(|_| self.bump())
+                })
+                .collect();
                 let mut opts: Vec<char> = flags.chars().collect();
                 opts.sort_unstable();
-                Ok(Bson::RegularExpression(Regex { pattern, options: opts.into_iter().collect() }))
+                Ok(Bson::RegularExpression(Regex {
+                    pattern,
+                    options: opts.into_iter().collect(),
+                }))
             }
             Some(c) if c.is_ascii_digit() || c == '-' || c == '.' => self.number(),
             Some(_) => {
-                let Some(word) = self.ident() else { return self.err("expected a value") };
+                let Some(word) = self.ident() else {
+                    return self.err("expected a value");
+                };
                 match word {
                     "true" => Ok(Bson::Boolean(true)),
                     "false" => Ok(Bson::Boolean(false)),
@@ -324,22 +402,34 @@ impl<'a> P<'a> {
         };
         match name {
             "ObjectId" => match first_str() {
-                Some(hex) => ObjectId::parse_str(&hex).map(Bson::ObjectId).map_err(|e| format!("ObjectId: {e}")),
+                Some(hex) => ObjectId::parse_str(&hex)
+                    .map(Bson::ObjectId)
+                    .map_err(|e| format!("ObjectId: {e}")),
                 None => Ok(Bson::ObjectId(ObjectId::new())),
             },
             "ISODate" | "Date" => match first_str() {
                 Some(s) => parse_date(&s).map(Bson::DateTime),
                 None => match args.first() {
-                    Some(Bson::Int32(n)) => Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
+                    Some(Bson::Int32(n)) => {
+                        Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64)))
+                    }
                     Some(Bson::Int64(n)) => Ok(Bson::DateTime(bson::DateTime::from_millis(*n))),
                     _ => Ok(Bson::DateTime(bson::DateTime::now())),
                 },
             },
-            "NumberInt" => int_arg(&args).and_then(|n| i32::try_from(n).map(Bson::Int32).map_err(|_| "NumberInt out of range".into())),
+            "NumberInt" => int_arg(&args).and_then(|n| {
+                i32::try_from(n)
+                    .map(Bson::Int32)
+                    .map_err(|_| "NumberInt out of range".into())
+            }),
             "NumberLong" => int_arg(&args).map(Bson::Int64),
             "NumberDecimal" => {
-                let text = first_str().or_else(|| args.first().map(|b| b.to_string())).unwrap_or_default();
-                text.parse::<bson::Decimal128>().map(Bson::Decimal128).map_err(|e| format!("NumberDecimal: {e}"))
+                let text = first_str()
+                    .or_else(|| args.first().map(|b| b.to_string()))
+                    .unwrap_or_default();
+                text.parse::<bson::Decimal128>()
+                    .map(Bson::Decimal128)
+                    .map_err(|e| format!("NumberDecimal: {e}"))
             }
             "UUID" => {
                 let s = first_str().ok_or("UUID expects a string")?;
@@ -351,7 +441,10 @@ impl<'a> P<'a> {
                     .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
                     .collect::<Result<Vec<u8>, _>>()
                     .map_err(|_| "UUID expects hex digits".to_string())?;
-                Ok(Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes }))
+                Ok(Bson::Binary(Binary {
+                    subtype: BinarySubtype::Uuid,
+                    bytes,
+                }))
             }
             other => Err(format!("unknown helper `{other}()`")),
         }
@@ -404,7 +497,11 @@ fn parse_date(s: &str) -> ParseResult<bson::DateTime> {
         format!("{s}T00:00:00Z")
     } else {
         let t = s.replacen(' ', "T", 1);
-        if t.ends_with('Z') || t[10..].contains(['+', '-']) { t } else { format!("{t}Z") }
+        if t.ends_with('Z') || t[10..].contains(['+', '-']) {
+            t
+        } else {
+            format!("{t}Z")
+        }
     };
     bson::DateTime::parse_rfc3339_str(&full).map_err(|e| format!("ISODate(\"{s}\"): {e}"))
 }
@@ -460,7 +557,9 @@ fn upsert(opts: Option<&Bson>) -> bool {
 pub fn parse(input: &str) -> ParseResult<Op> {
     let mut p = P::new(input.trim().trim_end_matches(';'));
     p.ws();
-    let first = p.ident().ok_or_else(|| "expected `db.<collection>.<method>(…)` or `show collections`".to_string())?;
+    let first = p.ident().ok_or_else(|| {
+        "expected `db.<collection>.<method>(…)` or `show collections`".to_string()
+    })?;
     match first {
         "show" => {
             let what = p.ident().unwrap_or_default();
@@ -470,7 +569,11 @@ pub fn parse(input: &str) -> ParseResult<Op> {
                 _ => Err(format!("unknown `show {what}`")),
             };
         }
-        "use" => return Err("`use` is not supported here; open a connection to that database instead".into()),
+        "use" => {
+            return Err(
+                "`use` is not supported here; open a connection to that database instead".into(),
+            )
+        }
         "db" => {}
         other => return Err(format!("expected `db`, found `{other}`")),
     }
@@ -482,7 +585,10 @@ pub fn parse(input: &str) -> ParseResult<Op> {
         name
     } else {
         p.expect('.')?;
-        let name = p.ident().ok_or("expected a collection name after `db.`")?.to_string();
+        let name = p
+            .ident()
+            .ok_or("expected a collection name after `db.`")?
+            .to_string();
         p.ws();
         if p.peek() == Some('(') {
             let args = p.args()?;
@@ -492,15 +598,35 @@ pub fn parse(input: &str) -> ParseResult<Op> {
             };
             match name.as_str() {
                 "getCollection" => s0.ok_or("getCollection expects a name")?,
-                "getCollectionNames" | "getCollectionInfos" => return finish(&mut p, Op::ListCollections),
+                "getCollectionNames" | "getCollectionInfos" => {
+                    return finish(&mut p, Op::ListCollections)
+                }
                 "createCollection" => {
                     let name = s0.ok_or("createCollection expects a name")?;
-                    return finish(&mut p, Op::CreateCollection { name, options: as_doc(args.get(1), "options")? });
+                    return finish(
+                        &mut p,
+                        Op::CreateCollection {
+                            name,
+                            options: as_doc(args.get(1), "options")?,
+                        },
+                    );
                 }
                 "runCommand" | "adminCommand" => {
-                    return finish(&mut p, Op::RunCommand { command: as_doc(args.first(), "command")? })
+                    return finish(
+                        &mut p,
+                        Op::RunCommand {
+                            command: as_doc(args.first(), "command")?,
+                        },
+                    )
                 }
-                "stats" => return finish(&mut p, Op::RunCommand { command: bson::doc! { "dbStats": 1 } }),
+                "stats" => {
+                    return finish(
+                        &mut p,
+                        Op::RunCommand {
+                            command: bson::doc! { "dbStats": 1 },
+                        },
+                    )
+                }
                 other => return Err(format!("unsupported database method `db.{other}()`")),
             }
         } else {
@@ -522,8 +648,14 @@ pub fn parse(input: &str) -> ParseResult<Op> {
             limit: if method == "findOne" { Some(1) } else { None },
             one: method == "findOne",
         },
-        "countDocuments" | "count" => Op::Count { coll, filter: as_doc(a(0), "filter")? },
-        "estimatedDocumentCount" => Op::Count { coll, filter: Document::new() },
+        "countDocuments" | "count" => Op::Count {
+            coll,
+            filter: as_doc(a(0), "filter")?,
+        },
+        "estimatedDocumentCount" => Op::Count {
+            coll,
+            filter: Document::new(),
+        },
         "distinct" => Op::Distinct {
             coll,
             field: match a(0) {
@@ -532,17 +664,26 @@ pub fn parse(input: &str) -> ParseResult<Op> {
             },
             filter: as_doc(a(1), "filter")?,
         },
-        "aggregate" => Op::Aggregate { coll, pipeline: as_docs(a(0), "pipeline")? },
-        "insertOne" | "insert" if matches!(a(0), Some(Bson::Document(_))) => {
-            Op::InsertOne { coll, doc: as_doc(a(0), "document")? }
-        }
-        "insertMany" | "insert" => Op::InsertMany { coll, docs: as_docs(a(0), "documents")? },
+        "aggregate" => Op::Aggregate {
+            coll,
+            pipeline: as_docs(a(0), "pipeline")?,
+        },
+        "insertOne" | "insert" if matches!(a(0), Some(Bson::Document(_))) => Op::InsertOne {
+            coll,
+            doc: as_doc(a(0), "document")?,
+        },
+        "insertMany" | "insert" => Op::InsertMany {
+            coll,
+            docs: as_docs(a(0), "documents")?,
+        },
         "updateOne" | "updateMany" => Op::Update {
             coll,
             filter: as_doc(a(0), "filter")?,
             update: match a(1) {
                 Some(Bson::Document(d)) => UpdateSpec::Doc(d.clone()),
-                Some(b @ Bson::Array(_)) => UpdateSpec::Pipeline(as_docs(Some(b), "update pipeline")?),
+                Some(b @ Bson::Array(_)) => {
+                    UpdateSpec::Pipeline(as_docs(Some(b), "update pipeline")?)
+                }
                 _ => return Err("update expects an update document or pipeline".into()),
             },
             many: method == "updateMany",
@@ -559,7 +700,11 @@ pub fn parse(input: &str) -> ParseResult<Op> {
             filter: as_doc(a(0), "filter")?,
             many: method != "deleteOne",
         },
-        "createIndex" => Op::CreateIndex { coll, keys: as_doc(a(0), "keys")?, options: as_doc(a(1), "options")? },
+        "createIndex" => Op::CreateIndex {
+            coll,
+            keys: as_doc(a(0), "keys")?,
+            options: as_doc(a(1), "options")?,
+        },
         "getIndexes" => Op::GetIndexes { coll },
         "drop" => Op::DropCollection { coll },
         other => return Err(format!("unsupported method `.{other}()`")),
@@ -571,11 +716,16 @@ pub fn parse(input: &str) -> ParseResult<Op> {
         let args = p.args()?;
         match (&mut op, m) {
             (Op::Find { sort, .. }, "sort") => *sort = Some(as_doc(args.first(), "sort")?),
-            (Op::Find { projection, .. }, "projection") => *projection = Some(as_doc(args.first(), "projection")?),
+            (Op::Find { projection, .. }, "projection") => {
+                *projection = Some(as_doc(args.first(), "projection")?)
+            }
             (Op::Find { limit, .. }, "limit") => *limit = Some(int_arg(&args)?),
             (Op::Find { skip, .. }, "skip") => *skip = Some(int_arg(&args)?.max(0) as u64),
             (Op::Find { coll, filter, .. }, "count" | "itcount") => {
-                op = Op::Count { coll: coll.clone(), filter: filter.clone() };
+                op = Op::Count {
+                    coll: coll.clone(),
+                    filter: filter.clone(),
+                };
             }
             (_, "pretty" | "toArray") => {}
             (_, other) => return Err(format!("unsupported cursor method `.{other}()`")),
@@ -606,15 +756,26 @@ pub fn to_shell(b: &Bson) -> String {
         Bson::ObjectId(o) => format!("ObjectId(\"{}\")", o.to_hex()),
         Bson::DateTime(d) => format!(
             "ISODate(\"{}\")",
-            d.try_to_rfc3339_string().unwrap_or_else(|_| d.timestamp_millis().to_string())
+            d.try_to_rfc3339_string()
+                .unwrap_or_else(|_| d.timestamp_millis().to_string())
         ),
         Bson::Decimal128(d) => format!("NumberDecimal(\"{d}\")"),
         Bson::RegularExpression(r) => format!("/{}/{}", r.pattern, r.options),
-        Bson::Array(a) => format!("[{}]", a.iter().map(to_shell).collect::<Vec<_>>().join(", ")),
+        Bson::Array(a) => format!(
+            "[{}]",
+            a.iter().map(to_shell).collect::<Vec<_>>().join(", ")
+        ),
         Bson::Document(d) => doc_to_shell(d),
         Bson::Binary(bin) if bin.subtype == BinarySubtype::Uuid && bin.bytes.len() == 16 => {
             let h: String = bin.bytes.iter().map(|x| format!("{x:02x}")).collect();
-            format!("UUID(\"{}-{}-{}-{}-{}\")", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+            format!(
+                "UUID(\"{}-{}-{}-{}-{}\")",
+                &h[0..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..]
+            )
         }
         other => other.clone().into_relaxed_extjson().to_string(),
     }
@@ -627,8 +788,12 @@ pub fn doc_to_shell(d: &Document) -> String {
     let parts: Vec<String> = d
         .iter()
         .map(|(k, v)| {
-            let plain = k.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
-                && k.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            let plain = k
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                && k.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
             let key = if plain { k.clone() } else { quote(k) };
             format!("{key}: {}", to_shell(v))
         })
@@ -660,10 +825,20 @@ mod tests {
     fn find_with_modifiers() {
         let op = parse("db.users.find({ age: { $gt: 30 }, 'name': /^a/i }, {name: 1,}).sort({name: -1}).skip(5).limit(10);").unwrap();
         match op {
-            Op::Find { coll, filter, projection, sort, skip, limit, one } => {
+            Op::Find {
+                coll,
+                filter,
+                projection,
+                sort,
+                skip,
+                limit,
+                one,
+            } => {
                 assert_eq!(coll, "users");
                 assert_eq!(filter.get_document("age").unwrap(), &doc! { "$gt": 30 });
-                assert!(matches!(filter.get("name"), Some(Bson::RegularExpression(r)) if r.pattern == "^a" && r.options == "i"));
+                assert!(
+                    matches!(filter.get("name"), Some(Bson::RegularExpression(r)) if r.pattern == "^a" && r.options == "i")
+                );
                 assert_eq!(projection, Some(doc! { "name": 1 }));
                 assert_eq!(sort, Some(doc! { "name": -1 }));
                 assert_eq!((skip, limit, one), (Some(5), Some(10), false));
@@ -674,11 +849,21 @@ mod tests {
 
     #[test]
     fn collection_access_forms() {
-        assert!(matches!(parse("db['my users'].find()").unwrap(), Op::Find { coll, .. } if coll == "my users"));
-        assert!(matches!(parse("db.getCollection(\"a.b\").countDocuments({})").unwrap(), Op::Count { coll, .. } if coll == "a.b"));
+        assert!(
+            matches!(parse("db['my users'].find()").unwrap(), Op::Find { coll, .. } if coll == "my users")
+        );
+        assert!(
+            matches!(parse("db.getCollection(\"a.b\").countDocuments({})").unwrap(), Op::Count { coll, .. } if coll == "a.b")
+        );
         assert_eq!(parse("show collections").unwrap(), Op::ListCollections);
-        assert_eq!(parse("db.getCollectionNames()").unwrap(), Op::ListCollections);
-        assert!(matches!(parse("db.users.find().count()").unwrap(), Op::Count { .. }));
+        assert_eq!(
+            parse("db.getCollectionNames()").unwrap(),
+            Op::ListCollections
+        );
+        assert!(matches!(
+            parse("db.users.find().count()").unwrap(),
+            Op::Count { .. }
+        ));
     }
 
     #[test]
@@ -690,9 +875,18 @@ mod tests {
         )
         .unwrap();
         let d = v.as_document().unwrap();
-        assert_eq!(d.get_object_id("_id").unwrap().to_hex(), "65a1b2c3d4e5f60718293a4b");
-        assert_eq!(d.get_datetime("at").unwrap().timestamp_millis(), 1_709_214_301_000);
-        assert_eq!(d.get_datetime("d").unwrap().timestamp_millis(), 1_704_067_200_000);
+        assert_eq!(
+            d.get_object_id("_id").unwrap().to_hex(),
+            "65a1b2c3d4e5f60718293a4b"
+        );
+        assert_eq!(
+            d.get_datetime("at").unwrap().timestamp_millis(),
+            1_709_214_301_000
+        );
+        assert_eq!(
+            d.get_datetime("d").unwrap().timestamp_millis(),
+            1_704_067_200_000
+        );
         assert_eq!(d.get_i64("n").unwrap(), 9_007_199_254_740_993);
         assert_eq!(d.get_i32("i").unwrap(), 7);
         assert_eq!(d.get_i64("big").unwrap(), 3_000_000_000);
@@ -700,38 +894,66 @@ mod tests {
         assert_eq!(d.get_str("s").unwrap(), "a\"b\n");
         assert!(matches!(d.get("u"), Some(Bson::Binary(b)) if b.subtype == BinarySubtype::Uuid));
         assert_eq!(to_shell(d.get("dec").unwrap()), "NumberDecimal(\"12.30\")");
-        assert_eq!(to_shell(d.get("u").unwrap()), "UUID(\"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\")");
+        assert_eq!(
+            to_shell(d.get("u").unwrap()),
+            "UUID(\"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\")"
+        );
     }
 
     #[test]
     fn writes_and_read_only_classification() {
         assert!(parse("db.u.insertOne({a: 1})").unwrap().is_write());
-        assert!(matches!(parse("db.u.insertMany([{a: 1}, {a: 2}])").unwrap(), Op::InsertMany { docs, .. } if docs.len() == 2));
+        assert!(
+            matches!(parse("db.u.insertMany([{a: 1}, {a: 2}])").unwrap(), Op::InsertMany { docs, .. } if docs.len() == 2)
+        );
         assert!(matches!(
             parse("db.u.updateMany({}, {$set: {a: 1}}, {upsert: true})").unwrap(),
-            Op::Update { many: true, upsert: true, .. }
+            Op::Update {
+                many: true,
+                upsert: true,
+                ..
+            }
         ));
-        assert!(matches!(parse("db.u.updateOne({}, [{$set: {a: 1}}])").unwrap(), Op::Update { update: UpdateSpec::Pipeline(_), .. }));
+        assert!(matches!(
+            parse("db.u.updateOne({}, [{$set: {a: 1}}])").unwrap(),
+            Op::Update {
+                update: UpdateSpec::Pipeline(_),
+                ..
+            }
+        ));
         assert!(!parse("db.u.aggregate([{$match: {}}])").unwrap().is_write());
-        assert!(parse("db.u.aggregate([{$match: {}}, {$out: 'x'}])").unwrap().is_write());
+        assert!(parse("db.u.aggregate([{$match: {}}, {$out: 'x'}])")
+            .unwrap()
+            .is_write());
         assert!(!parse("db.runCommand({ping: 1})").unwrap().is_write());
-        assert!(parse("db.runCommand({dropDatabase: 1})").unwrap().is_write());
+        assert!(parse("db.runCommand({dropDatabase: 1})")
+            .unwrap()
+            .is_write());
         assert!(!parse("db.u.find()").unwrap().is_write());
     }
 
     #[test]
     fn errors_are_readable() {
-        assert!(parse("db.u.find({a: })").unwrap_err().contains("expected a value"));
-        assert!(parse("db.u.frobnicate()").unwrap_err().contains("unsupported method"));
+        assert!(parse("db.u.find({a: })")
+            .unwrap_err()
+            .contains("expected a value"));
+        assert!(parse("db.u.frobnicate()")
+            .unwrap_err()
+            .contains("unsupported method"));
         assert!(parse("select 1").unwrap_err().contains("expected `db`"));
-        assert!(parse("db.u.find() extra").unwrap_err().contains("unexpected text"));
+        assert!(parse("db.u.find() extra")
+            .unwrap_err()
+            .contains("unexpected text"));
     }
 
     #[test]
     fn shell_roundtrip() {
         let d = doc! { "name": "ann", "tags": ["a", "b"], "n": 1.0, "weird key": { "x": true } };
         let text = doc_to_shell(&d);
-        assert_eq!(text, "{ name: \"ann\", tags: [\"a\", \"b\"], n: 1.0, \"weird key\": { x: true } }");
+        assert_eq!(
+            text,
+            "{ name: \"ann\", tags: [\"a\", \"b\"], n: 1.0, \"weird key\": { x: true } }"
+        );
         assert_eq!(parse_document(&text).unwrap(), d);
     }
 }

@@ -76,6 +76,9 @@ GUI just doesn't expose them.
   behaviour). The text in either mode survives the switch.
 - An empty value with an operator that needs one means no filter. It never sends `= ''`.
 - Values are always bound parameters (principle 5); the column is quoted by the dialect.
+- Operators are listed in plain words (`equals`, `greater than`, `is one of`, …) from
+  `FilterOp::title`; the value is typed by the column's declared type (`Filter::from_text`).
+- **Status:** built. MongoDB tabs and tables without known columns show only the raw box.
 
 **Commands:** `table.fetchPage` with `filters` (engine done). No new command.
 
@@ -94,6 +97,8 @@ GUI just doesn't expose them.
 - Long values truncate with an ellipsis. Selecting a cell shows a 1px accent outline.
 - Query results show the gutter too, and show types when the driver reports
   `Column.type_name`.
+- **Status:** built. The sort cycles descending, ascending, off. Row numbers are
+  positional, so they stay 1, 2, 3… after a sort.
 
 **Commands:** `table.fetchPage` (sort), `schema.describeTable` (PK and types for table
 tabs). Engine already returns `Column.type_name`; drivers fill it.
@@ -117,6 +122,16 @@ tabs). Engine already returns `Column.type_name`; drivers fill it.
   (the dot carries the connection colour, per `ui.md`).
 
 **Commands:** `table.fetchPage` (page, refresh), `result.export`, `export.table`.
+
+**Status:** built, with two changes from the plan above:
+- The connection (dot, name, driver, read-only) stays in the slim header at the top instead
+  of moving to this bar, so it shows in one place only.
+- The Data / Structure switch stays at the top of the table tab. *Add row* waits for
+  `table.stageChange`.
+The bar shows `6 rows · 0 ms · fetched just now`, then any message. On the right: previous,
+a page box, `of N`, next, refresh, and an *Export* menu (CSV / JSON file to
+~/Downloads; CSV / JSON / Markdown / SQL INSERT to the clipboard). The old table footer is
+gone. Query tabs keep their *Copy as* buttons above the results.
 
 ## 6. Tab strip
 

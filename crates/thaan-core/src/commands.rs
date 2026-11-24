@@ -318,7 +318,7 @@ struct TableArgs {
     session_id: SessionId,
     table: ObjectRef,
     #[serde(default)]
-    changes: Vec<StagedChange>,
+    changes: Box<[StagedChange]>,
 }
 
 #[derive(Deserialize)]
@@ -344,10 +344,10 @@ struct ExportArgs {
     path: Option<String>,
 }
 
-fn write_or_return(text: String, path: Option<String>) -> Result<Json> {
+fn write_or_return(text: &str, path: Option<String>) -> Result<Json> {
     match path {
         Some(p) => {
-            std::fs::write(&p, &text)?;
+            std::fs::write(&p, text)?;
             Ok(json!({ "path": p, "bytes": text.len() }))
         }
         None => Ok(json!({ "text": text })),
@@ -440,14 +440,14 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
             let req = a
                 .request
                 .ok_or_else(|| Error::InvalidParams("request is required".into()))?;
-            write_or_return(e.export_table(a.session_id, &req, &a.options)?, a.path)?
+            write_or_return(&e.export_table(a.session_id, &req, &a.options)?, a.path)?
         }
         "result.export" => {
             let a: ExportArgs = p(params)?;
             let rs = a
                 .result
                 .ok_or_else(|| Error::InvalidParams("result is required".into()))?;
-            write_or_return(e.export_result(a.session_id, &rs, &a.options)?, a.path)?
+            write_or_return(&e.export_result(a.session_id, &rs, &a.options)?, a.path)?
         }
         "savedQuery.list" => serde_json::to_value(e.saved_queries())?,
         "savedQuery.save" => serde_json::to_value(e.save_query(p::<SavedQuery>(params)?)?)?,

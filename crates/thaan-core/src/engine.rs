@@ -1,6 +1,10 @@
 //! The engine: drivers, saved data and open sessions. Shared by `Arc<Engine>`; every
 //! method takes `&self` and locks only what it needs, so a long query on one session
 //! does not block another.
+//!
+//! Store and session guards are held on purpose: through `save()` so the file matches the
+//! data, and from `begin()` to `commit()` so no other caller runs inside the transaction.
+#![allow(clippy::significant_drop_tightening)]
 
 use crate::connection::ConnectionConfig;
 use crate::dialect::{Dialect, QueryLanguage};
@@ -382,7 +386,12 @@ impl Engine {
         if let Some(r) = sess.fetch_page(req, true) {
             let (mut result, total_rows) = r?;
             result.elapsed_ms = t.elapsed().as_millis() as u64;
-            return Ok(TablePage { result, total_rows, page: req.page, page_size: req.page_size });
+            return Ok(TablePage {
+                result,
+                total_rows,
+                page: req.page,
+                page_size: req.page_size,
+            });
         }
         let (page, count) = table::page_queries(&s.dialect, req);
         let mut result = sess.execute(&page.sql, &page.params)?;
@@ -409,7 +418,8 @@ impl Engine {
         changes: &[StagedChange],
     ) -> Result<Vec<String>> {
         let s = self.session(id)?;
-        if let Some(p) = s.lock().preview_changes(t, changes) {
+        let native = s.lock().preview_changes(t, changes);
+        if let Some(p) = native {
             return Ok(p);
         }
         Ok(table::change_statements(&s.dialect, t, changes)
@@ -533,9 +543,9 @@ fn first_word(sql: &str) -> String {
     let mut s = sql.trim_start();
     loop {
         if let Some(r) = s.strip_prefix("--") {
-            s = r.split_once('\n').map(|x| x.1).unwrap_or("").trim_start();
+            s = r.split_once('\n').map_or("", |x| x.1).trim_start();
         } else if let Some(r) = s.strip_prefix("/*") {
-            s = r.split_once("*/").map(|x| x.1).unwrap_or("").trim_start();
+            s = r.split_once("*/").map_or("", |x| x.1).trim_start();
         } else if let Some(r) = s.strip_prefix('(') {
             s = r.trim_start();
         } else {

@@ -57,6 +57,43 @@ impl FilterOp {
         FilterOp::ALL.into_iter().find(|op| op.label() == label)
     }
 
+    /// Plain-words name for pickers, e.g. `greater than` for `>`.
+    pub fn title(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "equals",
+            FilterOp::Ne => "not equal to",
+            FilterOp::Lt => "less than",
+            FilterOp::Le => "at most",
+            FilterOp::Gt => "greater than",
+            FilterOp::Ge => "at least",
+            FilterOp::Like => "matches pattern",
+            FilterOp::NotLike => "doesn't match pattern",
+            FilterOp::In => "is one of",
+            FilterOp::IsNull => "is null",
+            FilterOp::IsNotNull => "is not null",
+        }
+    }
+
+    /// The inverse of [`FilterOp::title`].
+    pub fn from_title(title: &str) -> Option<FilterOp> {
+        FilterOp::ALL.into_iter().find(|op| op.title() == title)
+    }
+
+    /// Picker order: comparisons, then patterns and lists, then null checks.
+    pub const PICKER: [FilterOp; 11] = [
+        FilterOp::Eq,
+        FilterOp::Ne,
+        FilterOp::Gt,
+        FilterOp::Ge,
+        FilterOp::Lt,
+        FilterOp::Le,
+        FilterOp::Like,
+        FilterOp::NotLike,
+        FilterOp::In,
+        FilterOp::IsNull,
+        FilterOp::IsNotNull,
+    ];
+
     /// `false` for `is null` / `is not null`, which take no value.
     pub fn needs_value(self) -> bool {
         !matches!(self, FilterOp::IsNull | FilterOp::IsNotNull)
@@ -161,6 +198,13 @@ pub struct PageRequest {
     /// Raw `WHERE` text typed by the user (combined with `filters` using AND).
     #[serde(default)]
     pub raw_where: Option<String>,
+    /// Document databases: projection document typed by the user, e.g. `{ name: 1 }`.
+    #[serde(default)]
+    pub projection: Option<String>,
+    /// Document databases: sort document typed by the user, e.g. `{ age: -1 }`.
+    /// Overrides `sort` when set. SQL drivers ignore it.
+    #[serde(default)]
+    pub raw_sort: Option<String>,
     #[serde(default)]
     pub sort: Vec<Sort>,
     /// 0-based page index.
@@ -426,6 +470,8 @@ mod tests {
                 },
             ],
             raw_where: Some("name like 'a%'".into()),
+            projection: None,
+            raw_sort: None,
             sort: vec![Sort {
                 column: "id".into(),
                 descending: true,
@@ -452,6 +498,8 @@ mod tests {
             sort: vec![],
             filters: vec![],
             raw_where: None,
+            projection: None,
+            raw_sort: None,
             ..req()
         };
         let (p, _) = page_queries(&Dialect::MSSQL, &r);
@@ -470,19 +518,41 @@ mod tests {
         // Null checks take no value.
         assert_eq!(f(FilterOp::IsNull, "", None), Some(vec![]));
         // Values are typed by the column's declared type.
-        assert_eq!(f(FilterOp::Eq, "42", Some("integer")), Some(vec![Value::Int(42)]));
-        assert_eq!(f(FilterOp::Gt, "1.5", Some("REAL")), Some(vec![Value::Float(1.5)]));
-        assert_eq!(f(FilterOp::Eq, "t", Some("boolean")), Some(vec![Value::Bool(true)]));
+        assert_eq!(
+            f(FilterOp::Eq, "42", Some("integer")),
+            Some(vec![Value::Int(42)])
+        );
+        assert_eq!(
+            f(FilterOp::Gt, "1.5", Some("REAL")),
+            Some(vec![Value::Float(1.5)])
+        );
+        assert_eq!(
+            f(FilterOp::Eq, "t", Some("boolean")),
+            Some(vec![Value::Bool(true)])
+        );
         // A text column keeps leading zeros; unparsable numbers stay text.
-        assert_eq!(f(FilterOp::Eq, "007", Some("TEXT")), Some(vec![Value::Text("007".into())]));
-        assert_eq!(f(FilterOp::Eq, "abc", Some("INT")), Some(vec![Value::Text("abc".into())]));
+        assert_eq!(
+            f(FilterOp::Eq, "007", Some("TEXT")),
+            Some(vec![Value::Text("007".into())])
+        );
+        assert_eq!(
+            f(FilterOp::Eq, "abc", Some("INT")),
+            Some(vec![Value::Text("abc".into())])
+        );
         // `like` always binds text; `in` splits on commas.
-        assert_eq!(f(FilterOp::Like, "4%", Some("INT")), Some(vec![Value::Text("4%".into())]));
+        assert_eq!(
+            f(FilterOp::Like, "4%", Some("INT")),
+            Some(vec![Value::Text("4%".into())])
+        );
         assert_eq!(
             f(FilterOp::In, "1, 2,,3", Some("INT")),
             Some(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
         assert_eq!(FilterOp::from_label("not like"), Some(FilterOp::NotLike));
+        for op in FilterOp::ALL {
+            assert_eq!(FilterOp::from_title(op.title()), Some(op));
+            assert!(FilterOp::PICKER.contains(&op));
+        }
     }
 
     #[test]

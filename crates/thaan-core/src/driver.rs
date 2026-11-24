@@ -114,12 +114,20 @@ pub trait Session: Send {
     }
 
     /// Applies staged edits; returns affected rows. `None` means "use the SQL path".
-    fn apply_changes(&mut self, _table: &ObjectRef, _changes: &[StagedChange]) -> Option<Result<u64>> {
+    fn apply_changes(
+        &mut self,
+        _table: &ObjectRef,
+        _changes: &[StagedChange],
+    ) -> Option<Result<u64>> {
         None
     }
 
     /// Human-readable preview of staged edits. `None` means "use the SQL path".
-    fn preview_changes(&mut self, _table: &ObjectRef, _changes: &[StagedChange]) -> Option<Vec<String>> {
+    fn preview_changes(
+        &mut self,
+        _table: &ObjectRef,
+        _changes: &[StagedChange],
+    ) -> Option<Vec<String>> {
         None
     }
 }
