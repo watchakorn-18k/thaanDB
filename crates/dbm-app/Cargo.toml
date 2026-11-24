@@ -1,0 +1,16 @@
+[package]
+name = "dbm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dbm-app"
+path = "src/main.rs"
+
+[dependencies]
+dbm-core.workspace = true
+dbm-driver-sqlite.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+gpui-kit = { version = "0.11.0", features = ["tree-sitter-sql"] }

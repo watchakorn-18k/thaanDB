@@ -1,0 +1,4 @@
+/target
+*.db
+!crates/**/fixtures/*.db
+.DS_Store
