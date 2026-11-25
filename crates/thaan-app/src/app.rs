@@ -1,20 +1,42 @@
 //! Main window. All work is dispatched to `thaan_core::Engine`; this file only holds view
 //! state and layout (see AGENTS.md, principle 1 and 3).
 
+#[path = "cell_edit.rs"]
+mod cell_edit;
+#[path = "command_bar.rs"]
+mod command_bar;
 #[path = "doc_editor.rs"]
 mod doc_editor;
+#[path = "live.rs"]
+mod live;
+#[path = "settings.rs"]
+mod settings;
+#[path = "sidebar_tree.rs"]
+mod sidebar_tree;
+#[path = "structure.rs"]
+mod structure;
+#[path = "table_ops.rs"]
+mod table_ops;
+#[path = "transfer_dialog.rs"]
+mod transfer_dialog;
+#[path = "views.rs"]
+mod views;
+
+use sidebar_tree::ObjectTree;
 #[path = "home.rs"]
 mod home;
 
 use crate::docview::{view_switch, DocPanel, DocView};
-use crate::grid::ResultGrid;
+use crate::grid::{track_focus, ResultGrid, GRID_HEADER_H};
 use crate::theme;
 use gpui_kit::base::{Disableable as _, Selectable as _, StyledExt as _};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::table::{ColumnSort, DataTable, TableEvent, TableState};
 use gpui_kit::component::IndexPath;
@@ -45,8 +67,14 @@ actions!(
         CloseTab,
         TogglePalette,
         ToggleTheme,
+        OpenSettings,
         RefreshSchema,
-        Disconnect
+        Disconnect,
+        CopySelection,
+        AddRow,
+        PasteCell,
+        CloneRow,
+        DeleteRow
     ]
 );
 
@@ -70,7 +98,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(m!("t"), NewTab, Some("ThaanApp")),
         KeyBinding::new(m!("w"), CloseTab, Some("ThaanApp")),
         KeyBinding::new(m!("k"), TogglePalette, Some("ThaanApp")),
+        KeyBinding::new(m!(","), OpenSettings, Some("ThaanApp")),
         KeyBinding::new(m!("r"), RefreshSchema, Some("ThaanApp")),
+        // ⌘C in a result grid: the selected row (as TSV for spreadsheets) or cell.
+        KeyBinding::new(m!("c"), CopySelection, Some("DataTable")),
+        // In a table grid: paste into the selected cell, clone or delete its row.
+        KeyBinding::new(m!("v"), PasteCell, Some("DataTable")),
+        KeyBinding::new(m!("d"), CloneRow, Some("DataTable")),
+        KeyBinding::new("backspace", DeleteRow, Some("DataTable")),
+        KeyBinding::new("delete", DeleteRow, Some("DataTable")),
+        // ⌘N in a table tab: a new row (a new document on MongoDB).
+        KeyBinding::new(m!("n"), AddRow, Some("ThaanApp")),
     ]);
 }
 
@@ -101,6 +139,12 @@ enum TableView {
 }
 
 struct QueryTab {
+    /// The connection this tab belongs to (tabs of every connection share one strip).
+    ws: thaan_core::engine::SessionId,
+    /// The session it runs on: the connection's own, or one opened on another database
+    /// of the same server (`database` is then set).
+    sid: thaan_core::engine::SessionId,
+    database: Option<String>,
     title: SharedString,
     saved_id: Option<String>,
     editor: Entity<EditorState>,
@@ -124,8 +168,16 @@ struct FilterRow {
 
 struct TableTab {
     object: ObjectRef,
+    /// The connection this tab belongs to (tabs of every connection share one strip).
+    ws: thaan_core::engine::SessionId,
+    /// The session this tab reads from: the connection's own, or one opened on another
+    /// database of the same server (`database` is then set).
+    sid: thaan_core::engine::SessionId,
+    database: Option<String>,
     info: Option<TableInfo>,
     ddl: Option<String>,
+    /// The list the SQL Structure view shows (Columns, Indexes…).
+    struct_tab: structure::StructTab,
     /// Raw `WHERE` text (or a document query on MongoDB).
     filter: Entity<InputState>,
     /// Builder rows, combined with AND. Both modes keep their text across a switch.
@@ -135,6 +187,9 @@ struct TableTab {
     raw_mode: bool,
     /// Page number box in the status bar (1-based); Enter jumps there.
     page_input: Entity<InputState>,
+    /// Rows per page (100 by default); the box in the status bar sets it.
+    page_size: u64,
+    page_size_input: Entity<InputState>,
     /// When the current page arrived, for the "fetched … ago" note.
     fetched_at: Option<std::time::Instant>,
     page: Option<TablePage>,
@@ -146,6 +201,13 @@ struct TableTab {
     /// MongoDB: projection and sort documents next to the filter document.
     projection: Entity<InputState>,
     sort_doc: Entity<InputState>,
+    /// The command box: opens with a ready-to-run command for this object.
+    command: Entity<EditorState>,
+    /// The last command's result, shown instead of the paged rows until cleared.
+    command_result: Option<StatementResult>,
+    command_running: bool,
+    /// The command box is shown (it can be hidden to see only the grid).
+    command_open: bool,
     error: Option<String>,
     loading: bool,
 }
@@ -185,15 +247,33 @@ impl TableTab {
 }
 
 enum Tab {
-    Query(QueryTab),
+    Query(Box<QueryTab>),
     Table(Box<TableTab>),
+    /// A view of its own: the Redis key browser or the MQTT console (`views.rs`).
+    View(Box<views::ViewTab>),
 }
 
 impl Tab {
+    /// The connection this tab belongs to.
+    fn ws(&self) -> thaan_core::engine::SessionId {
+        match self {
+            Tab::Query(q) => q.ws,
+            Tab::Table(t) => t.ws,
+            Tab::View(v) => v.ws,
+        }
+    }
+
     fn title(&self) -> SharedString {
         match self {
-            Tab::Query(q) => q.title.clone(),
-            Tab::Table(t) => t.object.name.clone().into(),
+            Tab::Query(q) => match &q.database {
+                Some(db) => format!("{} · {db}", q.title).into(),
+                None => q.title.clone(),
+            },
+            Tab::Table(t) => match &t.database {
+                Some(db) => format!("{} · {db}", t.object.name).into(),
+                None => t.object.name.clone().into(),
+            },
+            Tab::View(v) => v.title.clone(),
         }
     }
 }
@@ -207,13 +287,42 @@ pub struct ThaanApp {
     conn_name: Entity<InputState>,
     conn_url: Entity<InputState>,
     conn_params: Vec<(String, ParamKind, Entity<InputState>)>,
+    /// A picker for each `Choice` parameter; it writes its pick into that parameter's input.
+    conn_choices: BTreeMap<String, Entity<SelectState<Vec<SharedString>>>>,
     conn_read_only: bool,
+    /// Colour for a new connection: tints its row, dot and the status bar.
+    conn_color: Entity<ColorPickerState>,
     /// A connect or test is running on a background thread.
     connecting: bool,
     connections: Vec<ConnectionConfig>,
     // workspace
     session: Option<SessionInfo>,
+    /// Other open connections, kept whole while another one is in front.
+    parked: Vec<live::Parked>,
+    /// The saved connection a connect is running for (its tree row says so).
+    connecting_id: Option<String>,
+    /// The saved connection whose connect was started by "Open": a query tab opens
+    /// for it once connected.
+    open_after_connect: Option<String>,
+    /// The sidebar row whose right-click menu is open (drawn highlighted).
+    menu_row: Option<SharedString>,
+    /// Sizes of the sidebar | content split; the status bar's left block follows the
+    /// sidebar's width.
+    main_split: Entity<gpui_kit::component::ResizableState>,
+    /// The open Rename / Duplicate / Truncate / Drop dialog.
+    op_dialog: Option<table_ops::OpDialog>,
+    /// App preferences (Settings dialog); saved through `Engine::set_settings`.
+    settings: thaan_core::store::Settings,
+    /// Settings dialog page and its MCP lookup.
+    settings_ui: settings::SettingsUi,
+    /// The past query that tab starts with (Recent queries on home), if any.
+    open_query_after_connect: Option<SavedQuery>,
+    /// The home screen stays in front while connections open behind it; the user goes to
+    /// the workspace by opening one (row click), and back with the title bar's Home.
+    on_home: bool,
     objects: Vec<SchemaObject>,
+    /// Sidebar tree: databases, expanded nodes, other databases' objects.
+    tree: ObjectTree,
     tree_filter: Entity<InputState>,
     rail: Rail,
     tabs: Vec<Tab>,
@@ -238,12 +347,20 @@ impl ThaanApp {
             .cloned()
             .expect("at least one driver is registered");
         let conn_params = Self::param_inputs(&driver, window, cx);
+        let conn_choices = Self::choice_pickers(&driver, &conn_params, window, cx);
         let conn_name = cx.new(|cx| InputState::new(window, cx).placeholder("My database"));
         let conn_url = cx.new(|cx| {
             InputState::new(window, cx).placeholder(
-                "postgres://user@host/db   mysql://…   mongodb://…   sqlite:/path/app.db",
+                "postgres://user@host/db   mysql://…   mongodb://…   redis://…   mqtt://…   sqlite:/path/app.db",
             )
         });
+        // A pasted or typed URL fills the fields below it.
+        cx.subscribe_in(&conn_url, window, |this, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.fill_from_url(window, cx);
+            }
+        })
+        .detach();
         let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands"));
         cx.subscribe(&tree_filter, |_, _, _: &InputEvent, cx| cx.notify())
@@ -283,7 +400,18 @@ impl ThaanApp {
         let mut home = home::HomeState::new(window, cx);
         // In-memory read of the already-loaded store; render never asks the engine.
         home.folders = engine.folders();
-        Self {
+        let main_split = cx.new(|_| gpui_kit::component::ResizableState::default());
+        // Redraw when the sidebar is resized, so the status bar's left block follows.
+        cx.observe(&main_split, |_, _, cx| cx.notify()).detach();
+        // A System theme follows the OS switching between light and dark.
+        cx.observe_window_appearance(window, |this, window, cx| {
+            this.follow_system_appearance(window, cx)
+        })
+        .detach();
+        let settings = engine.settings();
+        let mut app = Self {
+            settings,
+            settings_ui: Default::default(),
             engine,
             focus: cx.focus_handle(),
             drivers,
@@ -291,11 +419,22 @@ impl ThaanApp {
             conn_name,
             conn_url,
             conn_params,
+            conn_choices,
             conn_read_only: false,
+            conn_color: cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(0x14b8a6))),
             connecting: false,
             connections,
             session: None,
+            parked: Vec::new(),
+            connecting_id: None,
+            open_after_connect: None,
+            menu_row: None,
+            main_split,
+            op_dialog: None,
+            open_query_after_connect: None,
+            on_home: false,
             objects: Vec::new(),
+            tree: ObjectTree::default(),
             tree_filter,
             rail: Rail::Objects,
             tabs: Vec::new(),
@@ -307,7 +446,9 @@ impl ThaanApp {
             palette_scroll: ScrollHandle::new(),
             status: None,
             home,
-        }
+        };
+        app.refresh_home_history();
+        app
     }
 
     /// One input per driver parameter (the form is generated from `DriverInfo::params`).
@@ -336,12 +477,81 @@ impl ThaanApp {
             .collect()
     }
 
+    fn choice_pickers(
+        driver: &DriverInfo,
+        inputs: &[(String, ParamKind, Entity<InputState>)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BTreeMap<String, Entity<SelectState<Vec<SharedString>>>> {
+        let mut out = BTreeMap::new();
+        for (spec, (_, _, input)) in driver.params.iter().zip(inputs) {
+            if spec.kind != ParamKind::Choice || spec.choices.is_empty() {
+                continue;
+            }
+            let items: Vec<SharedString> = spec
+                .choices
+                .iter()
+                .cloned()
+                .map(SharedString::from)
+                .collect();
+            let current = input.read(cx).value().to_string();
+            let ix = spec.choices.iter().position(|c| *c == current).unwrap_or(0);
+            let picker = cx.new(|cx| SelectState::new(items, Some(IndexPath::new(ix)), window, cx));
+            let input = input.clone();
+            cx.subscribe_in(
+                &picker,
+                window,
+                move |_, _, ev: &SelectEvent<Vec<SharedString>>, window, cx| {
+                    let SelectEvent::Confirm(Some(v)) = ev else {
+                        return;
+                    };
+                    input.update(cx, |s, cx| s.set_value(v.to_string(), window, cx));
+                    cx.notify();
+                },
+            )
+            .detach();
+            out.insert(spec.key.clone(), picker);
+        }
+        out
+    }
+
     fn select_driver(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.drivers.get(ix).cloned() {
             self.conn_params = Self::param_inputs(&d, window, cx);
+            self.conn_choices = Self::choice_pickers(&d, &self.conn_params, window, cx);
             self.driver = d;
             cx.notify();
         }
+    }
+
+    /// Parses the URL field and copies what it names into the driver's fields: the driver
+    /// itself, then host, port, user, password, database and any `?key=value` options the
+    /// driver has a field for. Text that does not parse yet leaves the fields alone.
+    fn fill_from_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.conn_url.read(cx).value().trim().to_string();
+        let Ok(c) = ConnectionConfig::from_url(&url) else {
+            return;
+        };
+        if c.driver != self.driver.id {
+            let Some(ix) = self.drivers.iter().position(|d| d.id == c.driver) else {
+                return;
+            };
+            self.select_driver(ix, window, cx);
+        }
+        for (key, _, st) in &self.conn_params {
+            if let Some(v) = c.params.get(key) {
+                if st.read(cx).value().as_ref() != v.as_str() {
+                    st.update(cx, |s, cx| s.set_value(v.clone(), window, cx));
+                }
+            }
+        }
+        for (key, picker) in &self.conn_choices {
+            if let Some(v) = c.params.get(key) {
+                let v = SharedString::from(v.clone());
+                picker.update(cx, |p, cx| p.set_selected_value(&v, window, cx));
+            }
+        }
+        cx.notify();
     }
 
     fn is_mongo(&self) -> bool {
@@ -391,16 +601,22 @@ impl ThaanApp {
                 .unwrap_or_else(|| "connection".into());
         }
         c.read_only = self.conn_read_only;
+        c.color = self.conn_color.read(cx).value().map(hex_color);
         Ok(c)
     }
 
     /// Connects on a background thread: an unreachable host can take until the driver's
     /// timeout, and the window must stay responsive meanwhile.
     fn connect(&mut self, c: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+        // Already open: bring it to the front instead of opening it twice.
+        if let Some(sid) = self.live_for(&c.id) {
+            return self.activate(sid, cx);
+        }
         if self.connecting {
             return;
         }
         self.connecting = true;
+        self.connecting_id = Some(c.id.clone());
         self.set_status(format!("Connecting to {}…", c.name), false, cx);
         let engine = self.engine.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -414,15 +630,35 @@ impl ThaanApp {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.connecting = false;
+                this.connecting_id = None;
                 match res {
                     Ok((info, objects)) => {
-                        this.session = Some(info);
-                        this.objects = objects;
-                        this.tabs.clear();
-                        this.new_query_tab(None, window, cx);
+                        // Connecting only connects: the tree row gets its dot and unfolds,
+                        // and the main area stays as it is. Only "Open" (right-click)
+                        // also opens a query tab for it.
+                        let sid = info.session_id;
+                        let open = this.open_after_connect.take().as_deref()
+                            == Some(info.connection_id.as_str());
+                        this.adopt(info, objects);
+                        this.load_databases(sid, cx);
+                        let query = this.open_query_after_connect.take();
+                        if open {
+                            this.activate(sid, cx);
+                            let from_history = query.is_some();
+                            this.new_query_tab(query, window, cx);
+                            if from_history {
+                                if let Some(Tab::Query(t)) = this.tabs.last_mut() {
+                                    t.saved_id = None;
+                                }
+                            }
+                        }
                         this.set_status("Connected", false, cx);
                     }
-                    Err(e) => this.set_status(format!("Connection failed: {e}"), true, cx),
+                    Err(e) => {
+                        this.open_after_connect = None;
+                        this.open_query_after_connect = None;
+                        this.set_status(format!("Connection failed: {e}"), true, cx)
+                    }
                 }
             })
             .ok();
@@ -434,10 +670,14 @@ impl ThaanApp {
         if self.connecting {
             return;
         }
-        let c = match self.form_config(cx) {
+        let mut c = match self.form_config(cx) {
             Ok(c) => c,
             Err(e) => return self.set_status(e, true, cx),
         };
+        // Editing a saved connection: an empty password box tests with the stored one.
+        if let Some(id) = &self.home.editing {
+            c.id = id.clone();
+        }
         self.connecting = true;
         self.set_status(format!("Testing {}…", c.name), false, cx);
         let engine = self.engine.clone();
@@ -458,14 +698,12 @@ impl ThaanApp {
         .detach();
     }
 
+    /// Closes the connection in front; the next open one (or home) takes its place.
     fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if let Some(s) = self.session.take() {
-            self.engine.close(s.session_id).ok();
+        if let Some(sid) = self.active_sid() {
+            self.close_session(sid, cx);
         }
-        self.tabs.clear();
-        self.objects.clear();
         self.connections = self.engine.connections();
-        self.status = None;
         cx.notify();
     }
 
@@ -483,7 +721,10 @@ impl ThaanApp {
                     return;
                 }
                 match res {
-                    Ok(o) => this.objects = o,
+                    Ok(o) => {
+                        this.objects = o;
+                        this.load_databases(sid, cx);
+                    }
                     Err(e) => this.set_status(format!("Schema: {e}"), true, cx),
                 }
                 cx.notify();
@@ -503,9 +744,11 @@ impl ThaanApp {
     }
 
     fn new_grid(window: &mut Window, cx: &mut Context<Self>) -> Entity<TableState<ResultGrid>> {
-        cx.new(|cx| {
+        let grid = cx.new(|cx| {
             TableState::new(ResultGrid::new(ResultSet::default()), window, cx).sortable(true)
-        })
+        });
+        track_focus(&grid, cx);
+        grid
     }
 
     fn new_query_tab(
@@ -514,6 +757,7 @@ impl ThaanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(ws) = self.active_sid() else { return };
         let language = if self.is_mongo() { "javascript" } else { "sql" };
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -533,7 +777,10 @@ impl ThaanApp {
         };
         let grid = Self::new_grid(window, cx);
         let docs = Self::new_doc_panel(window, cx);
-        self.tabs.push(Tab::Query(QueryTab {
+        self.tabs.push(Tab::Query(Box::new(QueryTab {
+            ws,
+            sid: ws,
+            database: None,
             title,
             saved_id,
             editor: editor.clone(),
@@ -542,19 +789,37 @@ impl ThaanApp {
             grid,
             docs,
             running: false,
-        }));
+        })));
         self.active = self.tabs.len() - 1;
+        self.on_home = false;
         editor.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
     }
 
     fn open_table(&mut self, object: ObjectRef, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(i) = self
-            .tabs
-            .iter()
-            .position(|t| matches!(t, Tab::Table(tt) if tt.object == object))
-        {
+        self.open_table_on(None, object, window, cx)
+    }
+
+    /// Opens a table tab. `on` is another database's session of this connection (and
+    /// that database's name); `None` reads from the connection's own session. The tab
+    /// shows at once; its columns and first page load in the background.
+    fn open_table_on(
+        &mut self,
+        on: Option<(thaan_core::engine::SessionId, String)>,
+        object: ObjectRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_sid() else { return };
+        let (sid, database) = match on {
+            Some((sid, db)) => (sid, Some(db)),
+            None => (ws, None),
+        };
+        if let Some(i) = self.tabs.iter().position(
+            |t| matches!(t, Tab::Table(tt) if tt.object == object && tt.sid == sid && tt.ws == ws),
+        ) {
             self.active = i;
+            self.on_home = false;
             cx.notify();
             return;
         }
@@ -573,16 +838,24 @@ impl ThaanApp {
             }
         })
         .detach();
-        let info = self
-            .session
-            .as_ref()
-            .and_then(|s| self.engine.describe_table(s.session_id, &object).ok());
-        // The builder needs column names; without them (or on MongoDB) only the raw box works.
-        let builder = !self.is_mongo() && info.as_ref().is_some_and(|i| !i.columns.is_empty());
-        let first_row = info
-            .as_ref()
-            .filter(|_| builder)
-            .map(|i| Self::new_filter_row(0, i, window, cx));
+        // Columns arrive in the background (`describe_table` can wait on the server);
+        // until then only the raw WHERE box works.
+        let info: Option<TableInfo> = None;
+        let page_size = self.settings.page_size;
+        let page_size_input = cx.new(|cx| InputState::new(window, cx));
+        page_size_input.update(cx, |s, cx| s.set_value(page_size.to_string(), window, cx));
+        // Enter (or leaving the box) applies a typed page size.
+        cx.subscribe_in(
+            &page_size_input,
+            window,
+            |this, input, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let typed = input.read(cx).value().trim().parse::<u64>().ok();
+                    this.set_page_size(typed, window, cx);
+                }
+            },
+        )
+        .detach();
         let page_input = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe_in(
             &page_input,
@@ -603,18 +876,35 @@ impl ThaanApp {
         )
         .detach();
         // Table tabs sort on the server, so the order covers every page, not just this one.
-        let grid = Self::new_grid(window, cx);
-        // Selecting a row enables the document actions (view / edit / delete).
-        cx.subscribe(&grid, |_, _, _: &TableEvent, cx| cx.notify())
-            .detach();
+        // Cell selection, so a double-click reports which cell to edit; the grid draws
+        // its own row numbers, so the built-in row header stays off.
+        let grid = cx.new(|cx| {
+            TableState::new(ResultGrid::new(ResultSet::default()), window, cx)
+                .sortable(true)
+                .cell_selectable(true)
+                .row_header(false)
+        });
+        track_focus(&grid, cx);
+        // Selecting a row enables the document actions; double-clicking a cell edits it.
+        cx.subscribe_in(&grid, window, |this, _, ev: &TableEvent, window, cx| {
+            if let TableEvent::DoubleClickedCell(row, col) = ev {
+                this.begin_cell_edit(*row, *col, window, cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        // Staging or dropping a delete from the row menu updates the Apply count.
+        cx.observe(&grid, |_, _, cx| cx.notify()).detach();
         let weak = cx.entity().downgrade();
         let sort_object = object.clone();
-        let table_info = info.clone();
+        let act_on = cx.entity().downgrade();
         grid.update(cx, |g, _| {
             let d = g.delegate_mut();
-            if let Some(i) = &table_info {
-                d.set_table_info(i);
-            }
+            d.on_action = Some(std::rc::Rc::new(move |a, window, cx| {
+                act_on
+                    .update(cx, |app, cx| app.grid_action(a, window, cx))
+                    .ok();
+            }));
             d.set_server_sort(Box::new(move |column, sort, _, cx| {
                 let weak = weak.clone();
                 let object = sort_object.clone();
@@ -639,15 +929,36 @@ impl ThaanApp {
             })
             .detach();
         }
+        let starter = command_bar::starter_command(
+            self.session.as_ref().map_or("", |s| s.driver.as_str()),
+            &object,
+        );
+        let language = if self.is_mongo() { "javascript" } else { "sql" };
+        let command = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(language)
+                .line_number(true)
+        });
+        command.update(cx, |e, cx| e.set_value(starter, window, cx));
+        // Keep the "Ln, Col" status line current while typing.
+        cx.subscribe(&command, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
+        let describe_object = object.clone();
         self.tabs.push(Tab::Table(Box::new(TableTab {
             object,
+            ws,
+            sid,
+            database,
             info,
             ddl: None,
+            struct_tab: Default::default(),
             filter,
-            filter_rows: first_row.into_iter().collect(),
+            filter_rows: Vec::new(),
             next_filter_id: 1,
-            raw_mode: !builder,
+            raw_mode: true,
             page_input,
+            page_size,
+            page_size_input,
             fetched_at: None,
             page: None,
             page_ix: 0,
@@ -657,11 +968,68 @@ impl ThaanApp {
             docs,
             projection,
             sort_doc,
+            command,
+            command_result: None,
+            command_running: false,
+            // New table and collection tabs open on the data; the query box is one click away.
+            command_open: false,
             error: None,
             loading: false,
         })));
         self.active = self.tabs.len() - 1;
+        self.on_home = false;
         self.load_page(cx);
+        self.describe_in_background(ws, sid, describe_object, window, cx);
+    }
+
+    /// Loads a table tab's columns off the UI thread, then turns on the filter builder
+    /// and the typed grid headers. Dropped if the tab was closed meanwhile.
+    fn describe_in_background(
+        &mut self,
+        ws: thaan_core::engine::SessionId,
+        sid: thaan_core::engine::SessionId,
+        object: ObjectRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine.clone();
+        let mongo = self.is_mongo();
+        cx.spawn_in(window, async move |this, cx| {
+            let target = object.clone();
+            let Ok(info) = cx
+                .background_spawn(async move { engine.describe_table(sid, &target) })
+                .await
+            else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                // The builder needs column names; on MongoDB only the raw box works.
+                let builder = !mongo && !info.columns.is_empty();
+                let row = builder.then(|| Self::new_filter_row(0, &info, window, cx));
+                let Some(Tab::Table(t)) = this.tabs_of(ws).and_then(|tabs| {
+                    tabs.iter_mut().find(
+                        |t| matches!(t, Tab::Table(tt) if tt.object == object && tt.sid == sid),
+                    )
+                }) else {
+                    return;
+                };
+                t.grid.update(cx, |g, cx| {
+                    g.delegate_mut().set_table_info(&info);
+                    g.refresh(cx);
+                });
+                // Switch to the builder only if nothing was typed in the raw box yet.
+                if let Some(row) = row {
+                    if t.filter_rows.is_empty() && t.filter.read(cx).value().trim().is_empty() {
+                        t.filter_rows.push(row);
+                        t.raw_mode = false;
+                    }
+                }
+                t.info = Some(info);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Header click on a table tab: refetch page 1 sorted by `column` on the server.
@@ -762,6 +1130,44 @@ impl ThaanApp {
         self.apply_filter(cx);
     }
 
+    /// A request from a table grid's cell menu.
+    fn grid_action(
+        &mut self,
+        a: crate::grid::GridAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match a {
+            crate::grid::GridAction::Edit { row, col } => {
+                self.begin_cell_edit(row, col, window, cx)
+            }
+            crate::grid::GridAction::Filter { column, op, value } => {
+                let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) else {
+                    return;
+                };
+                let Some(r) = t.filter_rows.first() else {
+                    return;
+                };
+                let (col_pick, op_pick, input) = (r.column.clone(), r.op.clone(), r.value.clone());
+                t.raw_mode = false;
+                col_pick.update(cx, |s, cx| {
+                    s.set_selected_value(&SharedString::from(column), window, cx)
+                });
+                op_pick.update(cx, |s, cx| {
+                    s.set_selected_value(&SharedString::from(op.title()), window, cx)
+                });
+                let text = if value.is_null() {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
+                input.update(cx, |s, cx| s.set_value(text, window, cx));
+                self.apply_filter(cx);
+            }
+            other => self.row_action(other, window, cx),
+        }
+    }
+
     /// Re-fetches from page 1 with the current filter.
     fn apply_filter(&mut self, cx: &mut Context<Self>) {
         if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
@@ -773,8 +1179,18 @@ impl ThaanApp {
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.tabs.len() {
             self.tabs.remove(ix);
+            // Keep the same tab on screen when one before it closes.
+            if ix < self.active {
+                self.active -= 1;
+            }
             if self.active >= self.tabs.len() {
                 self.active = self.tabs.len().saturating_sub(1);
+            }
+            // The connection in front follows the tab now on screen.
+            if !self.on_home {
+                if let Some(ws) = self.tabs.get(self.active).map(Tab::ws) {
+                    self.activate(ws, cx);
+                }
             }
             cx.notify();
         }
@@ -783,6 +1199,10 @@ impl ThaanApp {
     // ---- running queries -------------------------------------------------------------
 
     fn run(&mut self, current_only: bool, cx: &mut Context<Self>) {
+        // ⌘↵ in a table tab runs its command box.
+        if matches!(self.tabs.get(self.active), Some(Tab::Table(_))) {
+            return self.run_table_command(cx);
+        }
         let Some(session) = &self.session else { return };
         let sid = session.session_id;
         let ix = self.active;
@@ -792,6 +1212,8 @@ impl ThaanApp {
         if q.running {
             return;
         }
+        // `sid` finds the tab again; `run_on` is the session the SQL runs on.
+        let run_on = q.sid;
         let ed = q.editor.read(cx);
         let sql = ed.value().to_string();
         let sel = ed.selected_range();
@@ -811,7 +1233,7 @@ impl ThaanApp {
         cx.notify();
         let engine = self.engine.clone();
         let req = QueryRequest {
-            session_id: sid,
+            session_id: run_on,
             sql,
             scope,
             params: BTreeMap::new(),
@@ -821,10 +1243,17 @@ impl ThaanApp {
                 .background_spawn(async move { engine.run_query(&req) })
                 .await;
             this.update(cx, |this, cx| {
-                let Some(Tab::Query(q)) = this.tabs.get_mut(ix) else {
+                // The tab may sit behind another connection by now; it still gets its result.
+                let in_front = this.active_sid() == Some(sid);
+                let Some(Tab::Query(q)) = this.tab_at(sid, ix) else {
                     return;
                 };
                 q.running = false;
+                let res = res;
+                this.refresh_home_history();
+                let Some(Tab::Query(q)) = this.tab_at(sid, ix) else {
+                    return;
+                };
                 match res {
                     Ok(results) => {
                         let last_ok = results.iter().rposition(|r| {
@@ -846,12 +1275,16 @@ impl ThaanApp {
                         });
                         let failed = q.results.iter().any(|r| r.error.is_some());
                         // DDL may have changed the schema.
-                        if q.results.iter().any(|r| is_ddl(&r.sql)) {
-                            this.refresh_schema(cx);
+                        let ddl = q.results.iter().any(|r| is_ddl(&r.sql));
+                        if in_front {
+                            if ddl {
+                                this.refresh_schema(cx);
+                            }
+                            this.set_status(msg, failed, cx);
                         }
-                        this.set_status(msg, failed, cx);
                     }
-                    Err(e) => this.set_status(e.to_string(), true, cx),
+                    Err(e) if in_front => this.set_status(e.to_string(), true, cx),
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -880,11 +1313,16 @@ impl ThaanApp {
 
     fn load_page(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
-        let sid = session.session_id;
+        // `ws` finds the tab again when the answer arrives; `sid` is the session it reads.
+        let ws = session.session_id;
+        let writable = !session.read_only;
         let ix = self.active;
         let Some(Tab::Table(t)) = self.tabs.get_mut(ix) else {
             return;
         };
+        let sid = t.sid;
+        // Paging or filtering leaves a command result for the paged view.
+        t.command_result = None;
         let (filters, raw_where) = t.where_parts(cx);
         let (projection, raw_sort) = t.document_shape(cx);
         let req = PageRequest {
@@ -895,7 +1333,7 @@ impl ThaanApp {
             raw_sort,
             sort: t.sort.clone(),
             page: t.page_ix,
-            page_size: 100,
+            page_size: t.page_size,
         };
         t.loading = true;
         cx.notify();
@@ -905,7 +1343,7 @@ impl ThaanApp {
                 .background_spawn(async move { engine.fetch_page(sid, &req) })
                 .await;
             this.update(cx, |this, cx| {
-                let Some(Tab::Table(t)) = this.tabs.get_mut(ix) else {
+                let Some(Tab::Table(t)) = this.tab_at(ws, ix) else {
                     return;
                 };
                 t.loading = false;
@@ -921,6 +1359,7 @@ impl ThaanApp {
                         t.grid.update(cx, |g, cx| {
                             g.delegate_mut().set_row_offset(offset);
                             g.delegate_mut().set(rs);
+                            g.delegate_mut().editable = writable;
                             g.refresh(cx);
                         });
                     }
@@ -937,7 +1376,27 @@ impl ThaanApp {
         match self.tabs.get(self.active)? {
             Tab::Query(q) => q.results.get(q.active_result)?.result.clone(),
             Tab::Table(t) => t.page.as_ref().map(|p| p.result.clone()),
+            Tab::View(_) => None,
         }
+    }
+
+    /// ⌘C in the grid in front: the selected row as TSV, or the selected cell's value.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let grid = match self.tabs.get(self.active) {
+            Some(Tab::Table(t)) => t.grid.clone(),
+            Some(Tab::Query(q)) => q.grid.clone(),
+            Some(Tab::View(_)) | None => return,
+        };
+        let Some(text) = grid.read(cx).delegate().selection_text() else {
+            return;
+        };
+        let what = if text.contains('\t') {
+            "Copied row"
+        } else {
+            "Copied"
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_status(what, false, cx);
     }
 
     fn copy_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
@@ -966,7 +1425,6 @@ impl ThaanApp {
     }
 
     fn export_table_to_file(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
-        let Some(s) = &self.session else { return };
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return;
         };
@@ -989,7 +1447,7 @@ impl ThaanApp {
         let path = dir.join(format!("{}.{}", t.object.name, format.extension()));
         let r = self
             .engine
-            .export_table(s.session_id, &req, &ExportOptions::new(format))
+            .export_table(t.sid, &req, &ExportOptions::new(format))
             .and_then(|text| std::fs::write(&path, text).map_err(Into::into));
         match r {
             Ok(()) => self.set_status(format!("Exported to {}", path.display()), false, cx),
@@ -1045,7 +1503,9 @@ impl ThaanApp {
                     // Without a session, hide what needs one (running queries, tabs…).
                     // Clearing history is left to search, so Enter on an unchanged
                     // list never erases anything.
-                    gui_runs(c.id) && (self.session.is_some() || c.id == "app.toggleTheme")
+                    gui_runs(c.id)
+                        && (self.session.is_some()
+                            || matches!(c.id, "app.toggleTheme" | "app.settings" | "data.transfer"))
                 } else {
                     c.title.to_lowercase().contains(&q)
                         || c.id.to_lowercase().contains(&q)
@@ -1099,15 +1559,25 @@ impl ThaanApp {
             "query.runCurrent" | "query.runSelection" => self.run(true, cx),
             "tab.new" => self.new_query_tab(None, window, cx),
             "tab.close" => self.close_tab(self.active, cx),
+            // Starts from the connection in front, if any.
+            "data.transfer" => {
+                let source = self
+                    .session
+                    .as_ref()
+                    .map(|s| (s.connection_id.clone(), None));
+                self.open_transfer_dialog(source, window, cx)
+            }
             "schema.refresh" | "schema.listObjects" => self.refresh_schema(cx),
             "connection.close" => self.disconnect(cx),
-            "app.toggleTheme" => theme::toggle(window, cx),
+            "app.toggleTheme" => self.toggle_theme(window, cx),
+            "app.settings" => self.open_settings(window, cx),
             "savedQuery.save" => self.save_current_query(cx),
             "history.list" => self.rail = Rail::History,
             "savedQuery.list" => self.rail = Rail::Saved,
             "result.export" => self.copy_result(ExportFormat::Csv, cx),
             "history.clear" => {
                 self.engine.clear_history().ok();
+                self.refresh_home_history();
             }
             other => self.set_status(
                 format!("`{other}` is available from the CLI: thaan run {other}"),
@@ -1132,11 +1602,13 @@ fn gui_runs(id: &str) -> bool {
             | "schema.listObjects"
             | "connection.close"
             | "app.toggleTheme"
+            | "app.settings"
             | "savedQuery.save"
             | "history.list"
             | "savedQuery.list"
             | "result.export"
             | "history.clear"
+            | "data.transfer"
     )
 }
 
@@ -1177,7 +1649,6 @@ fn summarize(results: &[StatementResult]) -> String {
 
 impl ThaanApp {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mongo = self.is_mongo();
         let theme = cx.theme().clone();
         let filter = self.tree_filter.read(cx).value().to_lowercase();
         let rail_btn = |id: &'static str,
@@ -1226,114 +1697,49 @@ impl ThaanApp {
                     .small()
                     .icon(icon("sun-moon"))
                     .tooltip("Toggle theme")
-                    .on_click(cx.listener(|_, _, window, cx| theme::toggle(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_theme(window, cx))),
             )
             .child(
                 Button::new("disc")
                     .ghost()
                     .small()
                     .icon(icon("unplug"))
-                    .tooltip("Disconnect")
-                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
+                    .tooltip("Disconnect all")
+                    .disabled(self.session.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.disconnect_all(cx))),
             );
 
         let content: AnyElement = match self.rail {
-            Rail::Objects => {
-                let mut groups: BTreeMap<ObjectKind, Vec<SchemaObject>> = BTreeMap::new();
-                for o in &self.objects {
-                    if filter.is_empty() || o.object.name.to_lowercase().contains(&filter) {
-                        groups.entry(o.kind).or_default().push(o.clone());
-                    }
-                }
-                let mut tree = v_flex()
-                    .id("tree")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .pb_2()
-                    .gap_0p5();
-                for (gi, (kind, items)) in groups.into_iter().enumerate() {
-                    tree = tree.child(
-                        group_label(
-                            if mongo && kind == ObjectKind::Table {
-                                "Collections"
-                            } else {
-                                kind.label_plural()
-                            },
-                            Some(items.len()),
-                            &theme,
-                        )
+            Rail::Objects => v_flex()
+                .size_full()
+                .child(
+                    h_flex()
                         .px_2()
-                        .pt(px(if gi == 0 { 4. } else { 16. }))
-                        .pb_1(),
-                    );
-                    let ic = match kind {
-                        ObjectKind::Table => "table",
-                        ObjectKind::View | ObjectKind::MaterializedView => "eye",
-                        ObjectKind::Index => "list",
-                        ObjectKind::Trigger => "zap",
-                        _ => "code",
-                    };
-                    let openable = matches!(
-                        kind,
-                        ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView
-                    );
-                    for (i, o) in items.into_iter().enumerate() {
-                        let obj = o.object.clone();
-                        let hover = theme.sidebar_accent;
-                        tree = tree.child(
-                            h_flex()
-                                .id(SharedString::from(format!("obj-{kind:?}-{i}")))
-                                .h(px(ROW_H))
-                                .flex_none()
-                                .gap_2()
-                                .px_2()
-                                .rounded(px(6.))
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(move |s| s.bg(hover))
-                                .child(icon(ic).size_4().text_color(theme.muted_foreground))
-                                .child(div().flex_1().truncate().child(o.object.name.clone()))
-                                .when_some(o.parent.clone(), |d, p| {
-                                    d.child(
-                                        div()
-                                            .text_xs()
-                                            .font_family(theme.mono_font_family.clone())
-                                            .text_color(theme.muted_foreground)
-                                            .child(p),
-                                    )
-                                })
-                                .when(openable, |d| {
-                                    d.on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_table(obj.clone(), window, cx)
-                                    }))
-                                }),
-                        );
-                    }
-                }
-                v_flex()
-                    .size_full()
-                    .child(
-                        h_flex()
-                            .px_2()
-                            .pt_2()
-                            .pb_1()
-                            .gap_1()
-                            .child(div().flex_1().child(Input::new(&self.tree_filter).small()))
-                            .child(
-                                Button::new("refresh")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(icon("refresh-cw"))
-                                    .tooltip("Refresh (⌘R)")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.refresh_schema(cx)),
-                                    ),
-                            ),
-                    )
-                    .child(tree)
-                    .into_any_element()
-            }
+                        .pt_2()
+                        .pb_1()
+                        .gap_1()
+                        .child(div().flex_1().child(Input::new(&self.tree_filter).small()))
+                        .child(
+                            Button::new("refresh")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon("refresh-cw"))
+                                .tooltip("Refresh (⌘R)")
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_schema(cx))),
+                        )
+                        .child(
+                            Button::new("tree-new-group")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon("folder-plus"))
+                                .tooltip("New group")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_group_dialog(window, cx)
+                                })),
+                        ),
+                )
+                .child(self.render_object_tree(&filter, cx))
+                .into_any_element(),
             Rail::Saved => {
                 let items = self.engine.saved_queries();
                 list_panel(
@@ -1487,12 +1893,46 @@ impl ThaanApp {
             .bg(theme.tab_bar)
             .border_b_1()
             .border_color(theme.border)
+            .child({
+                // Home: the overview, one tab away from the open tables and queries.
+                let home = self.on_home || self.tabs.is_empty();
+                h_flex()
+                    .id("tab-home")
+                    .h_full()
+                    .gap_2()
+                    .px_3()
+                    .text_sm()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .when(home, |d| {
+                        d.bg(theme.background)
+                            .border_b_2()
+                            .border_color(theme.primary)
+                    })
+                    .when(!home, |d| {
+                        d.text_color(theme.muted_foreground)
+                            .hover(|s| s.bg(theme.background.opacity(0.5)))
+                    })
+                    .child(icon("house").size_3p5())
+                    .child("Home")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.on_home = true;
+                        cx.notify();
+                    }))
+            })
             .children(self.tabs.iter().enumerate().map(|(i, t)| {
-                let active = i == self.active;
-                let ic = if matches!(t, Tab::Query(_)) {
-                    "file-code"
-                } else {
-                    "table"
+                let active = i == self.active && !self.on_home;
+                // Tabs of every connection share the strip; the dot says whose it is.
+                let owner = self
+                    .session_info(t.ws())
+                    .and_then(|s| s.color.as_deref())
+                    .and_then(parse_hex)
+                    .unwrap_or(theme.primary);
+                let ic = match t {
+                    Tab::Query(_) => "file-code",
+                    Tab::Table(_) => "table",
+                    Tab::View(v) => v.kind.icon(),
                 };
                 h_flex()
                     .id(("tab", i))
@@ -1513,6 +1953,7 @@ impl ThaanApp {
                         d.text_color(theme.muted_foreground)
                             .hover(|s| s.bg(theme.background.opacity(0.5)))
                     })
+                    .child(conn_dot(owner))
                     .child(icon(ic).size_3p5())
                     .child(t.title())
                     .child(
@@ -1525,10 +1966,7 @@ impl ThaanApp {
                                 this.close_tab(i, cx);
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active = i;
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.show_tab(i, cx)))
             }))
             .child(
                 Button::new("new-tab")
@@ -1681,6 +2119,7 @@ impl ThaanApp {
             Some(_) => DataTable::new(&q.grid)
                 .stripe(true)
                 .bordered(false)
+                .header_row_height(px(GRID_HEADER_H))
                 .into_any_element(),
         };
         let doc_switch = active
@@ -1741,15 +2180,15 @@ impl ThaanApp {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
                         t.view = v;
-                        if v == TableView::Structure && t.ddl.is_none() {
-                            if let Some(s) = &this.session {
-                                t.ddl = this.engine.ddl(s.session_id, &t.object).ok();
-                            }
-                        }
+                    }
+                    // `ddl` can wait on the server, so it loads in the background.
+                    if v == TableView::Structure {
+                        this.load_structure_ddl(false, cx);
                     }
                     cx.notify();
                 }))
         };
+        let cmd_open = t.command_open;
         let header = h_flex()
             .h(px(36.))
             .px_2()
@@ -1759,6 +2198,31 @@ impl ThaanApp {
             .child(seg("v-data", "Data", TableView::Data, cx))
             .child(seg("v-struct", "Structure", TableView::Structure, cx))
             .child(div().flex_1())
+            .when(view == TableView::Data, |d| {
+                d.child(
+                    Button::new("cmd-toggle")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon(if cmd_open {
+                            "panel-top-close"
+                        } else {
+                            "panel-top-open"
+                        }))
+                        .label("Query")
+                        .selected(cmd_open)
+                        .tooltip(if cmd_open {
+                            "Hide the query box"
+                        } else {
+                            "Show the query box for this table"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                                t.command_open = !t.command_open;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .when(view == TableView::Data && can_build, |d| {
                 d.child(
                     Button::new("filter-mode")
@@ -1925,6 +2389,7 @@ impl ThaanApp {
                     None => DataTable::new(&t.grid)
                         .stripe(true)
                         .bordered(false)
+                        .header_row_height(px(GRID_HEADER_H))
                         .into_any_element(),
                 };
                 v_flex()
@@ -1932,6 +2397,8 @@ impl ThaanApp {
                     .child(div().flex_1().overflow_hidden().child(grid))
                     .into_any_element()
             }
+            // SQL tables: Columns · Indexes · Relations · Triggers · DDL (structure.rs).
+            TableView::Structure if !self.is_mongo() => self.render_structure(t, cx),
             TableView::Structure => {
                 let info = t.info.clone();
                 let ddl = t.ddl.clone().unwrap_or_default();
@@ -2038,11 +2505,11 @@ impl ThaanApp {
                     .into_any_element()
             }
         };
-        v_flex()
+        let rest = v_flex()
             .size_full()
-            .child(header)
             .children(filter_bar)
             .children(self.render_doc_bar(cx))
+            .children(self.render_row_bar(cx))
             .child(
                 h_flex().flex_1().min_h_0().overflow_hidden().child(
                     div()
@@ -2052,7 +2519,24 @@ impl ThaanApp {
                         .overflow_hidden()
                         .child(body),
                 ),
-            )
+            );
+        // The command box and the grid share the height; drag the divider to resize.
+        let main: AnyElement = match self.render_command_bar(cx) {
+            Some(bar) => v_resizable(SharedString::from(format!("cmd-split-{}", self.active)))
+                .child(
+                    resizable_panel()
+                        .size(px(150.))
+                        .size_range(px(84.)..px(560.))
+                        .child(bar),
+                )
+                .child(resizable_panel().child(rest))
+                .into_any_element(),
+            None => rest.into_any_element(),
+        };
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().child(main))
             .into_any_element()
     }
 
@@ -2079,75 +2563,133 @@ impl ThaanApp {
             }
         }
 
-        let facts: Option<String> = table.and_then(|t| {
-            let p = t.page.as_ref()?;
-            let ago = t.fetched_at.map(|at| {
-                let s = at.elapsed().as_secs();
-                match s {
-                    0..=29 => "fetched just now".to_string(),
-                    30..=89 => "fetched 1 min ago".to_string(),
-                    _ if s < 3600 => format!("fetched {} min ago", (s + 30) / 60),
-                    _ => format!("fetched {} h ago", s / 3600),
-                }
-            });
-            let mut out = if p.result.documents.is_some() {
-                // MongoDB wording (docs/spec/mongodb-ui.md M7).
-                let first = p.page * p.page_size;
-                let shown = p.result.rows.len() as u64;
-                if shown == 0 {
-                    format!("No documents · {} ms", p.result.elapsed_ms)
-                } else {
-                    format!(
-                        "Documents {}–{} of {} · {} ms",
-                        first + 1,
-                        first + shown,
-                        p.total_rows,
-                        p.result.elapsed_ms
-                    )
-                }
-            } else {
-                format!(
-                    "{} · {} ms",
-                    plural(p.total_rows, "row"),
-                    p.result.elapsed_ms
-                )
-            };
-            if let Some(a) = ago {
-                out.push_str(" · ");
-                out.push_str(&a);
-            }
-            Some(out)
-        });
+        // Row count (with timing) and how long ago the page arrived.
+        let facts: Option<(String, Option<String>)> = any_table_facts(self, cx);
         let (msg, err) = match self.status.clone() {
             Some((m, e)) => (Some(m), e),
             None => (None, false),
         };
 
-        let mut bar = h_flex()
-            .h(px(32.))
+        // The bar takes the connection's colour, so it is clear which server this is.
+        let conn_color = self
+            .session
+            .as_ref()
+            .and_then(|s| s.color.as_deref())
+            .and_then(parse_hex);
+        let status_bg = conn_color.unwrap_or(theme.status_bar);
+        let status_border = conn_color.unwrap_or(theme.status_bar_border);
+        let status_ink = conn_color.map_or(theme.muted_foreground, ink_on);
+        // On a coloured bar every control takes the same ink as the text.
+        let bar_ink = conn_color.map(|_| status_ink);
+        let ghost = bar_ink.map(|i| bar_button(i, cx));
+        // Three parts, like the window above it: the connection under the sidebar,
+        // facts about the tab in the middle, the tab's controls on the right.
+        let ink = bar_ink.unwrap_or(theme.muted_foreground);
+        let sidebar_w = self
+            .main_split
+            .read(cx)
+            .sizes()
+            .first()
+            .copied()
+            .unwrap_or(px(270.));
+        let left = h_flex()
+            .w(sidebar_w)
             .flex_none()
+            .h_full()
             .px_3()
-            .gap_3()
+            .gap_2()
+            .border_r_1()
+            .border_color(ink.opacity(0.2))
+            .map(|d| match &self.session {
+                Some(s) => {
+                    let db = self
+                        .tree
+                        .current_database()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| s.name.clone());
+                    let driver = self
+                        .drivers
+                        .iter()
+                        .find(|x| x.id == s.driver)
+                        .map_or(s.driver.clone(), |x| x.name.clone());
+                    d.child(db_icon(&s.driver).size_3p5().flex_none().text_color(ink))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(db),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(ink.opacity(0.75))
+                                .child(driver),
+                        )
+                }
+                None => d.child(div().text_color(ink.opacity(0.75)).child("Not connected")),
+            });
+        let mut bar = h_flex()
+            .h(px(36.))
+            .flex_none()
             .text_xs()
-            .text_color(theme.muted_foreground)
-            .bg(theme.status_bar)
+            .text_color(status_ink)
+            .bg(status_bg)
             .border_t_1()
-            .border_color(theme.status_bar_border);
+            .border_color(status_border)
+            .child(left);
 
-        // An error replaces the facts; other messages sit after them.
+        // The open table: a switch to its other view, then its row count and age.
+        let any_table = match self.tabs.get(self.active) {
+            Some(Tab::Table(t)) if !self.on_home && self.session.is_some() => Some(t),
+            _ => None,
+        };
+        let mut middle = h_flex().flex_1().min_w_0().h_full().px_3().gap_4();
+        if let Some(t) = any_table {
+            let to_structure = t.view == TableView::Data;
+            let object = t.object.clone();
+            middle = middle.when(!self.is_mongo(), |m| {
+                m.child(
+                    bar_chip(
+                        "view-switch",
+                        if to_structure { "Structure" } else { "Data" },
+                        if to_structure { "list" } else { "table" },
+                        ink,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if to_structure {
+                            this.show_structure(&object, cx);
+                        } else if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
+                            t.view = TableView::Data;
+                            cx.notify();
+                        }
+                    })),
+                )
+            });
+        }
         if err {
-            bar = bar.child(
+            middle = middle.child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme.danger)
+                    .when(conn_color.is_none(), |d| d.text_color(theme.danger))
+                    .when(conn_color.is_some(), |d| d.font_weight(FontWeight::MEDIUM))
                     .child(msg.unwrap_or_default()),
             );
         } else {
-            bar = bar
-                .when_some(facts, |d, f| {
-                    d.child(div().flex_none().font_family(mono.clone()).child(f))
+            let fact = |ic: &'static str, text: String| {
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .child(icon(ic).size_3p5().text_color(ink.opacity(0.75)))
+                    .child(div().font_family(mono.clone()).child(text))
+            };
+            middle = middle
+                .when_some(facts, |d, (count, age)| {
+                    d.child(fact("hash", count))
+                        .when_some(age, |d, a| d.child(fact("clock", a)))
                 })
                 .child(
                     div()
@@ -2157,6 +2699,7 @@ impl ThaanApp {
                         .when_some(msg, |d, m| d.child(m)),
                 );
         }
+        bar = bar.child(middle);
 
         let Some(t) = table else {
             return bar.into_any_element();
@@ -2164,46 +2707,96 @@ impl ThaanApp {
         let Some((page, pages)) = t.page.as_ref().map(|p| (p.page, p.page_count())) else {
             return bar.into_any_element();
         };
+        let mongo = self.is_mongo();
+        let read_only = self.session.as_ref().is_some_and(|s| s.read_only);
+        let doc_selected = mongo
+            && t.view == TableView::Data
+            && self
+                .selected_doc_ref(cx)
+                .is_some_and(|d| d.get("_id").is_some());
+        // While a number box has the cursor it gets an ink ring and a stronger well.
+        let focused = |input: &Entity<InputState>, cx: &App| {
+            input.read(cx).focus_handle(cx).is_focused(window)
+        };
+        let size_focused = focused(&t.page_size_input, cx);
+        let page_focused = focused(&t.page_input, cx);
+        let size_box = self.page_size_box(ink, bar_ink, size_focused, cx);
+        let square = |id: &'static str, ic: &'static str| {
+            Button::new(id)
+                .xsmall()
+                .custom(bar_square(ink, cx))
+                .icon(icon(ic))
+                .w(px(28.))
+                .h(px(24.))
+        };
         let weak = cx.entity().downgrade();
-        let export = Button::new("export-menu")
-            .ghost()
-            .xsmall()
-            .icon(icon("download"))
-            .label("Export")
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                let item = |label: &'static str, f: fn(&mut ThaanApp, &mut Context<ThaanApp>)| {
-                    let weak = weak.clone();
-                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        weak.update(cx, f).ok();
+        let view_sql = self.view_as_query(cx);
+        let settings = square("table-menu", "settings").dropdown_menu_with_anchor(
+            Anchor::BottomRight,
+            move |menu, window, cx| {
+                let sql = view_sql.clone();
+                let (w1, w2) = (weak.clone(), weak.clone());
+                menu.submenu_with_icon(
+                    Some(icon("download")),
+                    "Export whole table",
+                    window,
+                    cx,
+                    move |m, _, _| {
+                        m.item(app_item(&w1, "CSV file", |a, cx| {
+                            a.export_table_to_file(ExportFormat::Csv, cx)
+                        }))
+                        .item(app_item(&w1, "JSON file", |a, cx| {
+                            a.export_table_to_file(ExportFormat::Json, cx)
+                        }))
+                    },
+                )
+                .submenu_with_icon(
+                    Some(icon("clipboard")),
+                    "Copy this page",
+                    window,
+                    cx,
+                    move |m, _, _| {
+                        m.item(app_item(&w2, "CSV", |a, cx| {
+                            a.copy_result(ExportFormat::Csv, cx)
+                        }))
+                        .item(app_item(&w2, "JSON", |a, cx| {
+                            a.copy_result(ExportFormat::Json, cx)
+                        }))
+                        .item(app_item(&w2, "Markdown", |a, cx| {
+                            a.copy_result(ExportFormat::Markdown, cx)
+                        }))
+                        .item(app_item(&w2, "SQL INSERT", |a, cx| {
+                            a.copy_result(ExportFormat::SqlInsert, cx)
+                        }))
+                    },
+                )
+                .item(
+                    PopupMenuItem::new(if mongo {
+                        "Copy view as find()"
+                    } else {
+                        "Copy view as SQL"
                     })
-                };
-                menu.label("Whole table to ~/Downloads")
-                    .item(item("CSV file", |a, cx| {
-                        a.export_table_to_file(ExportFormat::Csv, cx)
-                    }))
-                    .item(item("JSON file", |a, cx| {
-                        a.export_table_to_file(ExportFormat::Json, cx)
-                    }))
-                    .separator()
-                    .label("This page to the clipboard")
-                    .item(item("CSV", |a, cx| a.copy_result(ExportFormat::Csv, cx)))
-                    .item(item("JSON", |a, cx| a.copy_result(ExportFormat::Json, cx)))
-                    .item(item("Markdown", |a, cx| {
-                        a.copy_result(ExportFormat::Markdown, cx)
-                    }))
-                    .item(item("SQL INSERT", |a, cx| {
-                        a.copy_result(ExportFormat::SqlInsert, cx)
-                    }))
-            });
+                    .icon(icon("code"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()))
+                    }),
+                )
+            },
+        );
 
         bar.child(
             h_flex()
                 .flex_none()
+                .h_full()
+                .pr_3()
                 .gap_1()
+                .child(size_box)
+                .child(bar_divider(bar_ink, &theme))
                 .child(
                     Button::new("prev")
                         .ghost()
                         .xsmall()
+                        .when_some(ghost, |b, v| b.custom(v))
                         .icon(icon("chevron-left"))
                         .tooltip("Previous page")
                         .disabled(page == 0)
@@ -2215,15 +2808,41 @@ impl ThaanApp {
                         })),
                 )
                 .child(
+                    // A flat well instead of a boxed field, so it sits in the bar.
                     div()
-                        .w(px(48.))
-                        .child(Input::new(&t.page_input).xsmall().text_center()),
+                        .w(px(40.))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(if page_focused {
+                            ink
+                        } else {
+                            transparent_black()
+                        })
+                        .bg(ink.opacity(if page_focused { 0.2 } else { 0.12 }))
+                        .child(
+                            Input::new(&t.page_input)
+                                .xsmall()
+                                .appearance(false)
+                                .text_center()
+                                .font_family(mono.clone())
+                                .when_some(bar_ink, |d, i| d.text_color(i)),
+                        ),
                 )
-                .child(div().font_family(mono).child(format!("of {pages}")))
+                .child(
+                    div()
+                        .pl_1()
+                        .font_family(mono)
+                        .text_color(ink.opacity(0.75))
+                        .child(format!("of {pages}")),
+                )
                 .child(
                     Button::new("next")
                         .ghost()
                         .xsmall()
+                        .when_some(ghost, |b, v| b.custom(v))
                         .icon(icon("chevron-right"))
                         .tooltip("Next page")
                         .disabled(page + 1 >= pages)
@@ -2234,18 +2853,101 @@ impl ThaanApp {
                             this.load_page(cx);
                         })),
                 )
-                .child(div().mx_1().w(px(1.)).h(px(16.)).bg(theme.border))
+                .child(bar_divider(bar_ink, &theme))
                 .child(
-                    Button::new("refresh-page")
-                        .ghost()
-                        .xsmall()
-                        .icon(icon("refresh-cw"))
+                    square("refresh-page", "refresh-cw")
                         .tooltip("Fetch this page again")
                         .on_click(cx.listener(|this, _, _, cx| this.load_page(cx))),
                 )
-                .child(export),
+                .when(!read_only, |d| {
+                    d.child(
+                        square("add-row", "plus")
+                            .tooltip_with_action(
+                                if mongo { "Insert document" } else { "Add row" },
+                                &AddRow,
+                                Some("ThaanApp"),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
+                    )
+                })
+                // MongoDB: the selected document can be edited (or viewed, read-only)
+                // and deleted from here; both open a dialog first.
+                .when(doc_selected, |d| {
+                    d.child(
+                        square("edit-doc", if read_only { "eye" } else { "pencil" })
+                            .tooltip(if read_only {
+                                "View document"
+                            } else {
+                                "Edit document"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let kind = if read_only {
+                                    doc_editor::DocDialogKind::View
+                                } else {
+                                    doc_editor::DocDialogKind::Edit
+                                };
+                                this.open_doc_dialog(kind, window, cx)
+                            })),
+                    )
+                    .when(!read_only, |d| {
+                        d.child(
+                            square("delete-doc", "trash")
+                                .tooltip("Delete document")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_delete_selected_doc(window, cx)
+                                })),
+                        )
+                    })
+                })
+                .child(settings)
+                .children(self.render_staged_actions(bar_ink.map(|i| (i, status_bg)), cx)),
         )
         .into_any_element()
+    }
+
+    /// The open table tab's current view (filters, sort, page) as text to paste into a
+    /// query: a SELECT with the values inlined, or a find() on MongoDB.
+    fn view_as_query(&self, cx: &App) -> String {
+        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
+            return String::new();
+        };
+        let driver = self.session.as_ref().map_or("", |s| s.driver.as_str());
+        let (filters, raw_where) = t.where_parts(cx);
+        let (projection, raw_sort) = t.document_shape(cx);
+        if driver == "mongodb" {
+            let n = thaan_core::doc::Doc::String(t.object.name.clone()).to_pretty();
+            let filter = t.filter.read(cx).value().trim().to_string();
+            let mut q = format!(
+                "db.getCollection({n}).find({}{})",
+                if filter.is_empty() { "{}" } else { &filter },
+                projection.map(|p| format!(", {p}")).unwrap_or_default()
+            );
+            if let Some(s) = raw_sort {
+                q.push_str(&format!(".sort({s})"));
+            }
+            q.push_str(&format!(
+                ".skip({}).limit({})",
+                t.page_ix * t.page_size,
+                t.page_size
+            ));
+            return q;
+        }
+        if matches!(driver, "redis" | "mqtt") {
+            // Line-based languages: the key or topic's own command (no SQL to show).
+            return command_bar::starter_command(driver, &t.object);
+        }
+        let d = thaan_core::dialect::Dialect::for_driver(driver);
+        let req = PageRequest {
+            table: t.object.clone(),
+            filters,
+            raw_where,
+            projection: None,
+            raw_sort: None,
+            sort: t.sort.clone(),
+            page: t.page_ix,
+            page_size: t.page_size,
+        };
+        thaan_core::table::page_queries(&d, &req).0.preview(&d)
     }
 
     fn render_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2408,53 +3110,54 @@ impl Render for ThaanApp {
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_tab(this.active, cx)))
             .on_action(cx.listener(|this, _: &RefreshSchema, _, cx| this.refresh_schema(cx)))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &AddRow, window, cx| this.add_row(window, cx)))
+            .on_action(cx.listener(|this, _: &PasteCell, window, cx| {
+                if let Some((row, col)) = this.selected_cell(cx) {
+                    this.grid_action(crate::grid::GridAction::Paste { row, col }, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloneRow, window, cx| {
+                if let Some((row, _)) = this.selected_cell(cx) {
+                    this.grid_action(crate::grid::GridAction::CloneRow { row }, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DeleteRow, window, cx| {
+                if let Some((row, _)) = this.selected_cell(cx) {
+                    this.grid_action(crate::grid::GridAction::DeleteRow { row }, window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Disconnect, _, cx| this.disconnect(cx)))
-            .on_action(cx.listener(|_, _: &ToggleTheme, window, cx| theme::toggle(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleTheme, window, cx| this.toggle_theme(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
             );
 
-        // What the title bar names: the open connection, or the product on the home screen.
-        let title = match &self.session {
-            Some(s) => {
-                let color = s
-                    .color
-                    .as_deref()
-                    .and_then(parse_hex)
-                    .unwrap_or(theme.primary);
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(conn_dot(color))
-                    .child(
-                        db_icon(&s.driver)
-                            .size_4()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(div().font_medium().child(s.name.clone()))
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(s.driver.clone()),
-                    )
-                    .when(s.read_only, |d| {
-                        d.child(
-                            h_flex()
-                                .gap_1()
-                                .text_color(theme.muted_foreground)
-                                .child(icon("lock").size_3p5())
-                                .child("Read-only"),
-                        )
-                    })
-            }
-            None => h_flex()
-                .gap_2()
-                .items_center()
-                .child(crate::logo::mark(theme.primary, theme.foreground))
-                .child(div().font_medium().child("ThaanDB")),
-        };
+        // The title bar always names the product. The open connection is named by its
+        // tab, its sidebar row and the status bar; only read-only is repeated here, as a
+        // safety cue.
+        let read_only = self.session.as_ref().is_some_and(|s| s.read_only);
+        let title = h_flex()
+            .gap_2()
+            .items_center()
+            .child(crate::logo::mark(theme.primary, theme.foreground))
+            .child(div().font_medium().child("ThaanDB"))
+            .when(read_only, |d| {
+                d.child(
+                    h_flex()
+                        .gap_1()
+                        .text_color(theme.muted_foreground)
+                        .child(icon("lock").size_3p5())
+                        .child("Read-only"),
+                )
+            });
         // One row: macOS traffic lights (the kit's TitleBar leaves room for them), then
-        // the current context (logo or connection), New connection and the command palette.
+        // the ThaanDB logo and name, New connection and the command palette.
         let header = TitleBar::new().child(
             h_flex()
                 .flex_1()
@@ -2491,25 +3194,44 @@ impl Render for ThaanApp {
                         .on_click(
                             cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)),
                         ),
+                )
+                .child(
+                    Button::new("title-settings")
+                        .ghost()
+                        .small()
+                        .icon(icon("settings"))
+                        .tooltip_with_action("Settings", &OpenSettings, Some("ThaanApp"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                        ),
                 ),
         );
 
         let status = self.render_status(window, cx);
 
-        let main: AnyElement = if self.session.is_none() {
-            self.render_home(cx)
-        } else {
-            let content = if self.tabs.is_empty() {
-                empty_state(
-                    "Open a table from the sidebar or press ⌘T for a new query",
-                    &theme,
-                )
+        // One page, connected or not: the sidebar tree and the tab strip, where Home is
+        // the first tab. Connecting only changes that connection's row in the tree.
+        let main: AnyElement = {
+            let content = if self.session.is_none() || self.on_home || self.tabs.is_empty() {
+                // The width Home gets: the window less the rail and the sidebar.
+                let sidebar_w = self
+                    .main_split
+                    .read(cx)
+                    .sizes()
+                    .first()
+                    .copied()
+                    .unwrap_or(px(270.));
+                let width = window.viewport_size().width - sidebar_w - px(40.);
+                self.render_home(false, width, cx)
             } else if matches!(self.tabs.get(self.active), Some(Tab::Query(_))) {
                 self.render_query_tab(cx)
+            } else if let Some(Tab::View(v)) = self.tabs.get(self.active) {
+                v.view.clone().into_any_element()
             } else {
                 self.render_table_tab(cx)
             };
             h_resizable("main-split")
+                .with_state(&self.main_split)
                 .child(
                     resizable_panel()
                         .size(px(270.))
@@ -2537,6 +3259,12 @@ impl Render for ThaanApp {
 // ---- small view helpers ---------------------------------------------------------------
 
 type ThemeRef = gpui_kit::component::Theme;
+
+/// Rows per page when a table opens.
+/// Page sizes offered in the status bar's list; any other can be typed.
+const PAGE_SIZES: [u64; 7] = [1, 5, 10, 25, 50, 100, 200];
+/// The largest page size that can be typed, so one page never loads an unbounded result.
+const MAX_PAGE_SIZE: u64 = 1000;
 
 /// Height of every one-line row in the sidebar, the palette and the saved list.
 const ROW_H: f32 = 28.;
@@ -2583,8 +3311,94 @@ const PALETTE_KEY: &str = if cfg!(target_os = "macos") {
 } else {
     "ctrl-k"
 };
+/// New query tab and run-statement bindings, for the hints on home.
+const NEW_TAB_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-t"
+} else {
+    "ctrl-t"
+};
+const RUN_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-enter"
+} else {
+    "ctrl-enter"
+};
 
 /// The connection's own colour as a dot: the one signature mark, drawn the same everywhere.
+/// `#rrggbb` for a picked colour (stored with the connection).
+/// Black or white, whichever reads on a solid fill of `c`.
+pub(crate) fn ink_on(c: Hsla) -> Hsla {
+    let r = Rgba::from(c);
+    let lum = 0.2126 * r.r + 0.7152 * r.g + 0.0722 * r.b;
+    if lum > 0.5 {
+        gpui_kit::black()
+    } else {
+        gpui_kit::white()
+    }
+}
+
+/// A ghost status-bar button drawn in `ink`, with a faint ink hover.
+pub(crate) fn bar_button(ink: Hsla, cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(transparent_black())
+        .foreground(ink)
+        .hover(ink.opacity(0.12))
+        .active(ink.opacity(0.2))
+}
+
+/// A button drawn for the coloured status bar. The kit draws custom-coloured buttons at
+/// 20% strength, which leaves a primary action looking disabled there, so these two are
+/// our own: `solid` fills with the bar's ink and writes in the bar's colour; otherwise an
+/// ink outline. 24px tall, 6px corners, like the kit's xsmall buttons.
+pub(crate) fn bar_pill(
+    id: &'static str,
+    label: &'static str,
+    icon_name: Option<&'static str>,
+    solid: bool,
+    ink: Hsla,
+    bar: Hsla,
+) -> Stateful<Div> {
+    let fg = if solid { bar } else { ink };
+    h_flex()
+        .id(id)
+        .flex_none()
+        .h(px(24.))
+        .px_3()
+        .gap_1p5()
+        .rounded(px(6.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
+        .cursor_pointer()
+        .when(solid, |d| {
+            d.bg(ink)
+                .hover(move |s| s.bg(ink.opacity(0.85)))
+                .active(move |s| s.bg(ink.opacity(0.7)))
+        })
+        .when(!solid, |d| {
+            d.border_1()
+                .border_color(ink.opacity(0.55))
+                .hover(move |s| s.bg(ink.opacity(0.12)))
+                .active(move |s| s.bg(ink.opacity(0.2)))
+        })
+        .when_some(icon_name, |d, n| d.child(icon(n).size_3p5().text_color(fg)))
+        .child(label)
+}
+
+/// A hairline between groups in the status bar.
+pub(crate) fn bar_divider(ink: Option<Hsla>, theme: &ThemeRef) -> impl IntoElement {
+    div()
+        .mx_2()
+        .w(px(1.))
+        .h(px(14.))
+        .bg(ink.map_or(theme.border, |i| i.opacity(0.25)))
+}
+
+fn hex_color(c: Hsla) -> String {
+    let r = Rgba::from(c);
+    let b = |x: f32| (x.clamp(0., 1.) * 255.).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", b(r.r), b(r.g), b(r.b))
+}
+
 fn conn_dot(color: Hsla) -> impl IntoElement {
     div().flex_none().size(px(8.)).rounded_full().bg(color)
 }
@@ -2682,4 +3496,207 @@ fn parse_hex(s: &str) -> Option<Hsla> {
         .ok()
         .filter(|_| h.len() == 6)
         .map(|v| rgb(v).into())
+}
+
+/// The open table tab's facts for the status bar: its row count (with timing) and how
+/// long ago its page arrived.
+fn any_table_facts(app: &ThaanApp, _cx: &App) -> Option<(String, Option<String>)> {
+    let Some(Tab::Table(t)) = app.tabs.get(app.active) else {
+        return None;
+    };
+    if app.on_home {
+        return None;
+    }
+    if let Some(rs) = t.command_result.as_ref().and_then(|r| r.result.as_ref()) {
+        return Some((
+            format!(
+                "Query · {} · {} ms",
+                plural(rs.rows.len() as u64, "row"),
+                rs.elapsed_ms
+            ),
+            None,
+        ));
+    }
+    let p = t.page.as_ref()?;
+    let ago = t.fetched_at.map(|at| {
+        let s = at.elapsed().as_secs();
+        match s {
+            0..=29 => "just now".to_string(),
+            30..=89 => "1 min ago".to_string(),
+            _ if s < 3600 => format!("{} min ago", (s + 30) / 60),
+            _ => format!("{} h ago", s / 3600),
+        }
+    });
+    let count = if p.result.documents.is_some() {
+        // MongoDB wording (docs/spec/mongodb-ui.md M7).
+        let first = p.page * p.page_size;
+        let shown = p.result.rows.len() as u64;
+        if shown == 0 {
+            format!("No documents · {} ms", p.result.elapsed_ms)
+        } else {
+            format!(
+                "Documents {}–{} of {} · {} ms",
+                first + 1,
+                first + shown,
+                p.total_rows,
+                p.result.elapsed_ms
+            )
+        }
+    } else {
+        format!(
+            "{} · {} ms",
+            plural(p.total_rows, "row"),
+            p.result.elapsed_ms
+        )
+    };
+    Some((count, ago))
+}
+
+/// A filled square status-bar button: the bar's ink at about 12% behind an ink icon.
+/// The kit draws a custom fill at 20% strength, so 0.6 here lands near 12%.
+pub(crate) fn bar_square(ink: Hsla, cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(ink.opacity(0.6))
+        .foreground(ink)
+        .hover(ink.opacity(0.2))
+        .active(ink.opacity(0.28))
+}
+
+/// A small labelled status-bar control (the Structure / Data switch): icon and label in
+/// ink on a 12% ink well, 24px tall.
+pub(crate) fn bar_chip(
+    id: &'static str,
+    label: &'static str,
+    ic: &'static str,
+    ink: Hsla,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .flex_none()
+        .h(px(24.))
+        .px_2()
+        .gap_1p5()
+        .rounded(px(6.))
+        .bg(ink.opacity(0.12))
+        .hover(move |s| s.bg(ink.opacity(0.2)))
+        .active(move |s| s.bg(ink.opacity(0.28)))
+        .cursor_pointer()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .child(icon(ic).size_3p5().text_color(ink))
+        .child(label)
+}
+
+/// A menu row that runs `f` on the app.
+fn app_item(
+    weak: &WeakEntity<ThaanApp>,
+    label: &'static str,
+    f: fn(&mut ThaanApp, &mut Context<ThaanApp>),
+) -> PopupMenuItem {
+    let weak = weak.clone();
+    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+        weak.update(cx, f).ok();
+    })
+}
+
+impl ThaanApp {
+    /// Sets the open table's rows per page (typed or picked), back to page 1, and
+    /// reloads. An empty or invalid entry puts the current size back in the box.
+    fn set_page_size(&mut self, size: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let size = size.filter(|n| *n > 0).map(|n| n.min(MAX_PAGE_SIZE));
+        let changed = size.is_some_and(|n| n != t.page_size);
+        if let Some(n) = size {
+            t.page_size = n;
+        }
+        let shown = t.page_size.to_string();
+        t.page_size_input
+            .update(cx, |s, cx| s.set_value(shown, window, cx));
+        if changed {
+            t.page_ix = 0;
+            self.load_page(cx);
+        }
+    }
+
+    /// Rows per page: a typeable box with a list of common sizes beside it.
+    fn page_size_box(
+        &self,
+        ink: Hsla,
+        bar_ink: Option<Hsla>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
+            return div().into_any_element();
+        };
+        let mono = cx.theme().mono_font_family.clone();
+        let current = t.page_size;
+        let weak = cx.entity().downgrade();
+        let list_mono = mono.clone();
+        // "Rows" then one compact well: the typeable number and its list arrow read as
+        // a single control, sized like the page box next to it.
+        h_flex()
+            .flex_none()
+            .gap_1p5()
+            .child(div().text_color(ink.opacity(0.75)).child("Rows"))
+            .child(
+                h_flex()
+                    .h(px(24.))
+                    .pr_0p5()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if focused { ink } else { transparent_black() })
+                    .bg(ink.opacity(if focused { 0.2 } else { 0.12 }))
+                    .child(
+                        div().w(px(36.)).child(
+                            Input::new(&t.page_size_input)
+                                .xsmall()
+                                .appearance(false)
+                                .text_center()
+                                .font_family(mono)
+                                .when_some(bar_ink, |d, i| d.text_color(i)),
+                        ),
+                    )
+                    .child(
+                        Button::new("page-size")
+                            .ghost()
+                            .xsmall()
+                            .custom(bar_button(ink, cx))
+                            .icon(icon("chevron-down").size_3())
+                            .w(px(20.))
+                            .h(px(20.))
+                            .tooltip("Rows per page")
+                            .dropdown_menu_with_anchor(
+                                Anchor::BottomRight,
+                                move |mut menu, _, _| {
+                                    // A short list of numbers: narrow, no heading, the check on
+                                    // the right so the figures line up on the left.
+                                    menu = menu
+                                        .min_w(px(80.))
+                                        .check_side(gpui_kit::component::Side::Right);
+                                    for n in PAGE_SIZES {
+                                        let weak = weak.clone();
+                                        let mono = list_mono.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::element(move |_, _| {
+                                                div().font_family(mono.clone()).child(n.to_string())
+                                            })
+                                            .checked(n == current)
+                                            .on_click(move |_, window, cx| {
+                                                weak.update(cx, |app, cx| {
+                                                    app.set_page_size(Some(n), window, cx)
+                                                })
+                                                .ok();
+                                            }),
+                                        );
+                                    }
+                                    menu
+                                },
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }

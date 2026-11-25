@@ -30,12 +30,31 @@
   `scripts/bundle-macos.sh` (add `--release` for a release build): it builds `thaan-app` with
   cargo and writes `target/ThaanDB.app` with bundle id `dev.thaandb.app` and the app icon from
   `crates/thaan-app/assets/macos/AppIcon.icns`. It removes the old binary before copying
-  (overwriting it in place gets the process killed). Do not `codesign` the bundle (the window
-  then stops being visible to the tools). Launch with
-  `THAAN_HOME=target/thaan-home nohup target/ThaanDB.app/Contents/MacOS/thaan-app &`.
+  (overwriting it in place gets the process killed).
+- Do not `codesign` dev builds. On macOS, saved passwords go through Apple's
+  `/usr/bin/security` tool (`crates/thaan-keychain/src/lib.rs`, shared with `thaan mcp`), so the Keychain never
+  prompts, rebuild or not; signing is not needed for that (a self-signed identity did not help:
+  the Keychain trusts per Team ID).
+- Windows: `crates/thaan-app/build.rs` links `assets/windows/app.res` (the app icon as
+  resource 1, which GPUI loads for the window and taskbar, plus version info) into MSVC
+  builds. Regenerate it and `AppIcon.ico` with `scripts/make-windows-icon.sh` when the logo
+  or the workspace version changes. Release builds use the Windows GUI subsystem (no console
+  window); debug builds keep the console for logs.
+- Releases: pushing a `v*` tag runs `.github/workflows/release.yml` (Windows x64 zip and a
+  universal macOS app on a GitHub release); see `docs/releasing.md`.
+- Cross-compiling for Windows from macOS (`cargo xwin build --release -p thaan-app --target
+  x86_64-pc-windows-msvc`) fails in `gpui-pre-windows`: its release build needs `fxc.exe`,
+  which only exists on Windows. Build Windows releases on Windows (or CI). A test build from
+  a Mac needs a local patch of that crate that compiles the shaders at startup; never commit it.
 - The app icon and the title-bar mark come from `docs/brand` (see its README). Regenerate
   `AppIcon.icns` from `docs/brand/logo/thaandb-macos-icon*.svg` with `iconutil` if the logo changes.
 - Use `THAAN_HOME=target/thaan-home` for manual testing so the user's real store is untouched.
+- `scripts/dev-watch.sh` rebuilds and restarts the app on every save (cargo-watch; `--bundle`
+  relaunches `target/ThaanDB.app` for the screenshot tools). It is a restart, not hot reload:
+  GPUI cannot swap code into a running app, so tabs and connections are lost each time.
+- The dev profile keeps only line tables for our crates and no debug info for dependencies,
+  which roughly halves a one-line rebuild of `thaan-app` (29-39 s to 13-23 s measured). For a
+  debugger session with variables, build with `CARGO_PROFILE_DEV_DEBUG=true`.
 - `pkill -f thaan-app` also matches the shell running the command (its text contains the
   name) and kills it. Use `pkill -x thaan-app`.
 
@@ -68,7 +87,7 @@ rules for all contributors.)
   in words what it is waiting for:
   - Connecting: `Connecting to shop-prod…` on the button and in the status bar.
   - Running a query: `Running…` on Run, plus elapsed time in the status bar.
-  - Loading rows: a skeleton of grid rows (`Loading 100 rows…`), keeping the previous
+  - Loading rows: a skeleton of grid rows (`Loading 50 rows…`), keeping the previous
     page visible while the next one loads.
   - Schema: skeleton rows in the tree while objects load.
   - Export / import: a progress count (`Exporting… 12,400 rows`) with Cancel.
@@ -78,7 +97,7 @@ rules for all contributors.)
 
 ### Use as little RAM as possible
 
-- Never load a whole table or an unbounded result. Tables are paged (100 rows by default).
+- Never load a whole table or an unbounded result. Tables are paged (50 rows by default).
   Query results are capped, with a clear "first N rows" note and a way to load more.
 - Stream exports and imports to and from disk row by row. Never build the whole file as
   one `String` or `Vec`.
@@ -102,12 +121,12 @@ rules for all contributors.)
 
 ### Known gaps in the app today (fix these first)
 
-1. Opening a table calls `describe_table`, and Structure calls `ddl`, on the UI thread.
-   On PostgreSQL or MySQL the window freezes while the server answers.
+1. (Fixed) `describe_table` and `ddl` now run in the background: the table tab, the
+   sidebar's Open structure and the Structure view's DDL tab (`structure.rs`).
 2. Export to file reads the whole table and writes it on the UI thread
    (`export_table_to_file` in `app.rs`; `Engine::export_table` returns one `String`).
-3. The home screen and the History / Saved queries panels call `engine.history(200)` and
-   `engine.saved_queries()` on every render.
+3. The History / Saved queries panels call `engine.history(200)` and
+   `engine.saved_queries()` on every render (the home screen now reads a cache).
 4. Query results have no row cap; `select *` on a big table loads all of it.
 5. Each result is held twice: in the tab (`QueryTab.results`, `TableTab.page`) and in the
    grid (`ResultGrid.rs`).
@@ -195,18 +214,27 @@ Notes from using them:
 | Quick connect | `plug` |
 | Connection group (closed / open), new group, move to group | `folder` / `folder-open`, `folder-plus`, `folder-input` |
 | Duplicate, copy to clipboard | `copy`, `clipboard` |
+| Copy connection URL, copy host | `link`, `server` |
+| Copy for spreadsheets, as JSON, as SQL | `sheet`, `braces`, `code` |
+| Clone row, keep (undo delete), set NULL, paste | `copy-plus`, `undo-2`, `circle-slash`, `clipboard-paste` |
+| See row / document | `eye` |
+| Data transfer, swap source and target | `arrow-left-right` |
+| New table / collection | `table-2` |
 | Disconnect | `unplug` |
-| Shortcuts card / command palette | `keyboard` / `command` |
-| From the terminal (CLI) | `terminal` |
+| Command palette | `command` |
 | Theme toggle | `sun-moon` |
+| Settings pages: General, MCP (AI agents) | `sliders-horizontal`, `bot` |
+| Settings | `settings` |
 | Run | `play` |
 | Refresh | `refresh-cw` |
 | Export / download | `download` |
 | Add / remove a row or condition | `plus` / `minus` |
-| Delete | `trash` |
+| Delete, drop | `trash` |
+| Truncate (delete all rows) | `eraser` |
 | Edit, confirm | `pencil`, `check` |
 | Close, back, search | `x`, `arrow-left`, `search` |
 | Paging, disclosure | `chevron-left`, `chevron-right`, `chevron-down` |
 | Filter builder / raw WHERE toggle | `list-filter` / `square-code` |
+| Tiles / list view switch | `layout-grid` / `layout-list` |
 | Read-only | `lock` |
 | Primary-key mark in grid headers | `key-round` |

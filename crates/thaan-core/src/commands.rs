@@ -6,6 +6,7 @@
 use crate::connection::ConnectionConfig;
 use crate::engine::{Engine, QueryRequest, SessionId};
 use crate::export::ExportOptions;
+use crate::object_ops::ObjectOp;
 use crate::schema::ObjectRef;
 use crate::store::SavedQuery;
 use crate::table::{PageRequest, StagedChange};
@@ -193,7 +194,55 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "schema.listObjects",
             "List schema objects",
             "Schema",
+            "{sessionId, database?}",
+            None,
+            false
+        ),
+        cmd!(
+            "session.command",
+            "Run a driver command",
+            "Query",
+            "{sessionId, command} (not kept in history)",
+            None,
+            false
+        ),
+        cmd!(
+            "keys.scan",
+            "Scan keys",
+            "Keys",
+            "{sessionId, pattern?, keyType?, cursor?, count?} → {keys: [{name, keyType, ttl?}], cursor, total?}",
+            None,
+            false
+        ),
+        cmd!(
+            "broker.messages",
+            "Read broker messages",
+            "Broker",
+            "{sessionId, since?, limit?} → [{id, atMs, topic, payload, size, qos, retain, sent}]",
+            None,
+            false
+        ),
+        cmd!(
+            "broker.subscriptions",
+            "List broker subscriptions",
+            "Broker",
             "{sessionId}",
+            None,
+            false
+        ),
+        cmd!(
+            "schema.listDatabases",
+            "List databases",
+            "Schema",
+            "{sessionId}",
+            None,
+            false
+        ),
+        cmd!(
+            "schema.setDatabase",
+            "Switch database",
+            "Schema",
+            "{sessionId, database}",
             None,
             false
         ),
@@ -222,6 +271,22 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             false
         ),
         cmd!(
+            "structure.preview",
+            "Preview a structure change",
+            "Structure",
+            "{sessionId, table: {schema?, name}, op} where op is one of {op: addColumn, name, dataType, nullable?, default?} | {op: dropColumn, name} | {op: alterColumn, name, renameTo?, from?, to?: {dataType, nullable?, default?}} | {op: createIndex, name, columns, unique?} | {op: dropIndex, name} | {op: addForeignKey, name?, columns, refTable: {name}, refColumns, onUpdate?, onDelete?} | {op: dropForeignKey, name}",
+            None,
+            false
+        ),
+        cmd!(
+            "structure.apply",
+            "Apply a structure change",
+            "Structure",
+            "{sessionId, table, op} (op as in structure.preview)",
+            None,
+            true
+        ),
+        cmd!(
             "table.fetchPage",
             "Fetch table page",
             "Table",
@@ -233,7 +298,7 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "table.previewChanges",
             "Preview staged changes",
             "Table",
-            "{sessionId, table, changes}",
+            "{sessionId, table, changes: [{kind: insert, values} | {kind: update, key, set} | {kind: delete, key}]} with values/key/set as [[column, {type: int|float|text|bool|bytes|null, value}]]",
             None,
             false
         ),
@@ -241,8 +306,64 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "table.applyChanges",
             "Apply staged changes",
             "Table",
-            "{sessionId, table, changes}",
+            "{sessionId, table, changes} (changes as in table.previewChanges)",
             Some("cmd-s"),
+            true
+        ),
+        cmd!(
+            "table.previewOp",
+            "Preview a table operation",
+            "Table",
+            "{sessionId, table, kind?, op: {op: rename|drop|truncate|duplicate, to?, withData?}}",
+            None,
+            false
+        ),
+        cmd!(
+            "table.rename",
+            "Rename table",
+            "Table",
+            "{sessionId, table, kind?, to}",
+            None,
+            true
+        ),
+        cmd!(
+            "table.duplicate",
+            "Duplicate table",
+            "Table",
+            "{sessionId, table, to, withData?}",
+            None,
+            true
+        ),
+        cmd!(
+            "table.truncate",
+            "Truncate table",
+            "Table",
+            "{sessionId, table}",
+            None,
+            true
+        ),
+        cmd!(
+            "data.transfer",
+            "Transfer data",
+            "Table",
+            "{source, target, tables: [ObjectRef], content?: structureAndData|structureOnly|dataOnly, existing?: append|truncate|replace, batchSize?}",
+            None,
+            true
+        ),
+        cmd!(
+            "collection.create",
+            "Create collection",
+            "Table",
+            "{sessionId, name}",
+            None,
+            true
+        ),
+        cmd!(
+            "table.drop",
+            "Drop table",
+            "Table",
+            "{sessionId, table, kind?}",
+            None,
             true
         ),
         cmd!(
@@ -301,6 +422,22 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             None,
             true
         ),
+        cmd!(
+            "settings.get",
+            "Show settings",
+            "Settings",
+            "{}",
+            None,
+            false
+        ),
+        cmd!(
+            "settings.set",
+            "Change settings",
+            "Settings",
+            "{theme?: system|light|dark, fontSize?, pageSize?, historyLimit?}",
+            None,
+            false
+        ),
         // GUI-only commands are registered too so the palette and shortcuts list them.
         cmd!(
             "tab.new",
@@ -317,6 +454,14 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "App",
             "{}",
             Some("cmd-k"),
+            false
+        ),
+        cmd!(
+            "app.settings",
+            "Settings",
+            "App",
+            "{}",
+            Some("cmd-,"),
             false
         ),
         cmd!(
@@ -342,6 +487,23 @@ fn p<T: DeserializeOwned>(v: &Json) -> Result<T> {
 #[serde(rename_all = "camelCase")]
 struct Sid {
     session_id: SessionId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpArgs {
+    session_id: SessionId,
+    table: ObjectRef,
+    #[serde(default = "table_kind")]
+    kind: crate::schema::ObjectKind,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    with_data: Option<bool>,
+}
+
+fn table_kind() -> crate::schema::ObjectKind {
+    crate::schema::ObjectKind::Table
 }
 
 #[derive(Deserialize)]
@@ -461,7 +623,38 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
             serde_json::to_value(e.run_query(&req)?)?
         }
         "schema.listObjects" | "schema.refresh" => {
-            serde_json::to_value(e.list_objects(p::<Sid>(params)?.session_id)?)?
+            let sid = p::<Sid>(params)?.session_id;
+            match params["database"].as_str() {
+                Some(db) => serde_json::to_value(e.list_objects_in(sid, db)?)?,
+                None => serde_json::to_value(e.list_objects(sid)?)?,
+            }
+        }
+        "session.command" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let text: String = p(&params["command"])?;
+            serde_json::to_value(e.driver_command(sid, &text)?)?
+        }
+        "keys.scan" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let scan: crate::browse::KeyScan = p(params)?;
+            serde_json::to_value(e.scan_keys(sid, &scan)?)?
+        }
+        "broker.messages" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let since: u64 = params.get("since").map(p).transpose()?.unwrap_or(0);
+            let limit: usize = params.get("limit").map(p).transpose()?.unwrap_or(1000);
+            serde_json::to_value(e.messages_since(sid, since, limit)?)?
+        }
+        "broker.subscriptions" => {
+            serde_json::to_value(e.subscriptions(p::<Sid>(params)?.session_id)?)?
+        }
+        "schema.listDatabases" => {
+            serde_json::to_value(e.list_databases(p::<Sid>(params)?.session_id)?)?
+        }
+        "schema.setDatabase" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let db: String = p(&params["database"])?;
+            serde_json::to_value(e.switch_database(sid, &db)?)?
         }
         "schema.describeTable" => {
             let a: TableArgs = p(params)?;
@@ -471,6 +664,16 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
             let a: TableArgs = p(params)?;
             json!({ "ddl": e.ddl(a.session_id, &a.table)? })
         }
+        "structure.preview" | "structure.apply" => {
+            let a: TableArgs = p(params)?;
+            let op: crate::structure_ops::StructureOp = p(&params["op"])?;
+            if id == "structure.preview" {
+                json!({ "statements": e.structure_op_statements(a.session_id, &a.table, &op)? })
+            } else {
+                e.run_structure_op(a.session_id, &a.table, &op)?;
+                json!({ "ok": true })
+            }
+        }
         "table.fetchPage" => {
             let sid = p::<Sid>(params)?.session_id;
             let req: PageRequest = p(&params["request"])?;
@@ -479,6 +682,46 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
         "table.previewChanges" => {
             let a: TableArgs = p(params)?;
             serde_json::to_value(e.preview_changes(a.session_id, &a.table, &a.changes)?)?
+        }
+        "table.previewOp" => {
+            let a: OpArgs = p(params)?;
+            let op: ObjectOp = p(&params["op"])?;
+            json!({ "statements": e.object_op_statements(a.session_id, a.kind, &a.table, &op)? })
+        }
+        "data.transfer" => {
+            let req: crate::transfer::TransferRequest = p(params)?;
+            let never = std::sync::atomic::AtomicBool::new(false);
+            serde_json::to_value(e.transfer(&req, &|_| {}, &never)?)?
+        }
+        "collection.create" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let name: String = p(&params["name"])?;
+            let object = ObjectRef { schema: None, name };
+            e.run_object_op(
+                sid,
+                crate::schema::ObjectKind::Table,
+                &object,
+                &ObjectOp::Create,
+            )?;
+            json!({ "ok": true })
+        }
+        "table.rename" | "table.duplicate" | "table.truncate" | "table.drop" => {
+            let a: OpArgs = p(params)?;
+            let to = || {
+                a.to.clone()
+                    .ok_or_else(|| Error::InvalidParams("`to` is required".into()))
+            };
+            let op = match id {
+                "table.rename" => ObjectOp::Rename { to: to()? },
+                "table.duplicate" => ObjectOp::Duplicate {
+                    to: to()?,
+                    with_data: a.with_data.unwrap_or(true),
+                },
+                "table.truncate" => ObjectOp::Truncate,
+                _ => ObjectOp::Drop,
+            };
+            e.run_object_op(a.session_id, a.kind, &a.table, &op)?;
+            json!({ "ok": true })
         }
         "table.applyChanges" => {
             let a: TableArgs = p(params)?;
@@ -511,6 +754,17 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
         "history.clear" => {
             e.clear_history()?;
             json!({ "ok": true })
+        }
+        "settings.get" => serde_json::to_value(e.settings())?,
+        "settings.set" => {
+            // Fields left out keep their current value.
+            let mut merged = serde_json::to_value(e.settings())?;
+            if let (Some(m), Some(new)) = (merged.as_object_mut(), params.as_object()) {
+                for (k, v) in new {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::to_value(e.set_settings(p::<crate::store::Settings>(&merged)?)?)?
         }
         other if find(other).is_some() => {
             return Err(Error::Unsupported(format!(

@@ -99,6 +99,16 @@ pub trait Session: Send {
         self.execute("ROLLBACK", &[]).map(|_| ())
     }
 
+    /// Databases on the server (schemas, for MySQL). Empty when the driver has one.
+    fn list_databases(&mut self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// The database this session uses, if the driver has the concept.
+    fn current_database(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Cheap round trip used by "Test connection".
     fn ping(&mut self) -> Result<()> {
         self.execute("SELECT 1", &[]).map(|_| ())
@@ -119,6 +129,29 @@ pub trait Session: Send {
         _table: &ObjectRef,
         _changes: &[StagedChange],
     ) -> Option<Result<u64>> {
+        None
+    }
+
+    /// One step of a keyspace scan (key-value stores). `None`: not a key-value store.
+    fn scan_keys(
+        &mut self,
+        _scan: &crate::browse::KeyScan,
+    ) -> Option<Result<crate::browse::KeyPage>> {
+        None
+    }
+
+    /// Buffered broker messages with an id above `since`, oldest first, at most `limit`.
+    /// `None`: not a message broker.
+    fn messages_since(
+        &mut self,
+        _since: u64,
+        _limit: usize,
+    ) -> Option<Result<Vec<crate::browse::BrokerMessage>>> {
+        None
+    }
+
+    /// The broker subscriptions this session holds. `None`: not a message broker.
+    fn subscriptions(&mut self) -> Option<Result<Vec<crate::browse::Subscription>>> {
         None
     }
 

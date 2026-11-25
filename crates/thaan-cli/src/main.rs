@@ -14,6 +14,8 @@ use thaan_core::store::Store;
 use thaan_core::table::PageRequest;
 use thaan_core::{ResultSet, Value};
 
+mod mcp;
+
 const USAGE: &str = "\
 thaan — ThaanDB command-line client
 
@@ -30,6 +32,8 @@ USAGE:
   thaan export <url> <table> [--format csv] [--out FILE] [--where SQL]
   thaan run <commandId> [json] [--url URL]  Dispatch any command; with --url a session is
                                             opened first and `sessionId` is filled in
+  thaan mcp                                 MCP server on stdin/stdout for AI agents
+                                            (Claude Code: claude mcp add thaandb -- thaan mcp)
   Global: --store FILE   use this store instead of the default (connections, history)
 
 URL examples: sqlite:./app.db  sqlite::memory:  postgres://user@host/db
@@ -86,6 +90,9 @@ fn engine(args: &Args) -> Result<Engine> {
         None => Store::in_memory(),
     };
     let e = Engine::new(store);
+    // Saved passwords live in the OS keychain (written by the desktop app or `add_connection`).
+    #[cfg(feature = "keychain")]
+    let e = e.with_secrets(Arc::new(thaan_keychain::Keychain));
     #[cfg(feature = "sqlite")]
     e.register_driver(Arc::new(thaan_driver_sqlite::SqliteDriver));
     #[cfg(feature = "postgres")]
@@ -94,6 +101,10 @@ fn engine(args: &Args) -> Result<Engine> {
     e.register_driver(Arc::new(thaan_driver_mysql::MysqlDriver));
     #[cfg(feature = "mongodb")]
     e.register_driver(Arc::new(thaan_driver_mongodb::MongoDriver));
+    #[cfg(feature = "redis")]
+    e.register_driver(Arc::new(thaan_driver_redis::RedisDriver));
+    #[cfg(feature = "mqtt")]
+    e.register_driver(Arc::new(thaan_driver_mqtt::MqttDriver));
     Ok(e)
 }
 
@@ -194,6 +205,7 @@ fn real_main() -> Result<()> {
     }
     let e = engine(&args)?;
     match cmd {
+        "mcp" => return mcp::serve(Arc::new(e)),
         "commands" => {
             for c in builtin_commands() {
                 let short = c.shortcut.map(|s| format!("  [{s}]")).unwrap_or_default();

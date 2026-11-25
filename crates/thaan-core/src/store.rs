@@ -11,6 +11,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SECRET_KEYS: &[&str] = &["password", "sshPassword", "sshPassphrase"];
 pub const HISTORY_LIMIT: usize = 1000;
 
+/// Light, dark, or follow the operating system.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemePreference {
+    System,
+    Light,
+    #[default]
+    Dark,
+}
+
+/// App preferences, edited in the Settings dialog (`settings.get` / `settings.set`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Settings {
+    pub theme: ThemePreference,
+    /// Base interface text size in pixels (the window's rem); 16 is the default.
+    pub font_size: u16,
+    /// Rows per page for a newly opened table.
+    pub page_size: u64,
+    /// Queries kept in history; older ones are dropped.
+    pub history_limit: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::Dark,
+            font_size: 16,
+            page_size: 50,
+            history_limit: HISTORY_LIMIT,
+        }
+    }
+}
+
+impl Settings {
+    /// Keeps every value in its supported range.
+    pub fn clamped(mut self) -> Self {
+        self.font_size = self.font_size.clamp(14, 18);
+        self.page_size = self.page_size.clamp(1, 1000);
+        self.history_limit = self.history_limit.clamp(10, 10_000);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedQuery {
@@ -53,6 +97,8 @@ pub struct StoreData {
     pub saved_queries: Vec<SavedQuery>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 /// JSON file store. `path == None` keeps everything in memory (tests, CLI one-shots).
@@ -125,9 +171,15 @@ impl Store {
             e.id = new_id();
         }
         self.data.history.push(e);
+        self.trim_history();
+    }
+
+    /// Drops the oldest entries past the history limit in the settings.
+    pub fn trim_history(&mut self) {
+        let limit = self.data.settings.clone().clamped().history_limit;
         let n = self.data.history.len();
-        if n > HISTORY_LIMIT {
-            self.data.history.drain(..n - HISTORY_LIMIT);
+        if n > limit {
+            self.data.history.drain(..n - limit);
         }
     }
 }
@@ -181,5 +233,23 @@ mod tests {
         }
         assert_eq!(s.data.history.len(), HISTORY_LIMIT);
         assert_eq!(s.data.history[0].sql, "select 5");
+        s.data.settings.history_limit = 100;
+        s.trim_history();
+        assert_eq!(s.data.history.len(), 100);
+        assert_eq!(
+            s.data.history[0].sql,
+            format!("select {}", HISTORY_LIMIT + 5 - 100)
+        );
+    }
+
+    #[test]
+    fn settings_default_and_old_stores() {
+        let d: StoreData = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.settings, Settings::default());
+        let d: StoreData =
+            serde_json::from_str(r#"{"settings":{"theme":"light","pageSize":9999}}"#).unwrap();
+        assert_eq!(d.settings.theme, ThemePreference::Light);
+        assert_eq!(d.settings.font_size, 16);
+        assert_eq!(d.settings.clone().clamped().page_size, 1000);
     }
 }

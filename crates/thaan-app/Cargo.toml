@@ -9,11 +9,15 @@ name = "thaan-app"
 path = "src/main.rs"
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mongodb"]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "mqtt", "keychain"]
+# Keeps connection passwords in the OS keychain between runs.
+keychain = ["dep:thaan-keychain"]
 sqlite = ["dep:thaan-driver-sqlite"]
 postgres = ["dep:thaan-driver-postgres"]
 mysql = ["dep:thaan-driver-mysql"]
 mongodb = ["dep:thaan-driver-mongodb"]
+redis = ["dep:thaan-driver-redis"]
+mqtt = ["dep:thaan-driver-mqtt"]
 
 [dependencies]
 thaan-core.workspace = true
@@ -21,6 +25,11 @@ thaan-driver-sqlite = { workspace = true, optional = true }
 thaan-driver-postgres = { workspace = true, optional = true }
 thaan-driver-mysql = { workspace = true, optional = true }
 thaan-driver-mongodb = { workspace = true, optional = true }
+thaan-driver-redis = { workspace = true, optional = true }
+thaan-driver-mqtt = { workspace = true, optional = true }
+thaan-keychain = { workspace = true, optional = true }
 serde_json.workspace = true
+# Local time for the MQTT console; already built as part of GPUI.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow.workspace = true
 gpui-kit = { version = "0.11.0", features = ["tree-sitter-sql", "tree-sitter-javascript"] }

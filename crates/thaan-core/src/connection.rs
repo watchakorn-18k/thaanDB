@@ -47,6 +47,8 @@ impl ConnectionConfig {
             "sqlserver" | "mssql" => "mssql",
             "cockroachdb" | "cockroach" => "postgres",
             "mongodb" | "mongodb+srv" => "mongodb",
+            "redis" => "redis",
+            "mqtt" | "tcp" => "mqtt",
             other => return Err(Error::UnknownDriver(other.to_string())),
         }
         .to_string();
@@ -158,6 +160,93 @@ impl ConnectionConfig {
     }
 }
 
+impl ConnectionConfig {
+    /// The connection as a URL that `from_url` reads back, e.g.
+    /// `postgres://app@db.example.com:5432/shop?sslmode=require`. The password goes in
+    /// only when given (it is never stored in the config). Other driver parameters
+    /// become `?key=value` options. `None` for drivers without a URL form.
+    pub fn to_url(&self, password: Option<&str>) -> Option<String> {
+        let userinfo = |user: Option<&str>| -> String {
+            match (user, password.filter(|p| !p.is_empty())) {
+                (Some(u), Some(p)) => format!("{}:{}@", percent_encode(u), percent_encode(p)),
+                (Some(u), None) => format!("{}@", percent_encode(u)),
+                (None, Some(p)) => format!(":{}@", percent_encode(p)),
+                (None, None) => String::new(),
+            }
+        };
+        match self.driver.as_str() {
+            "sqlite" => {
+                let path = self.param("path").unwrap_or(":memory:");
+                Some(format!("sqlite:{path}"))
+            }
+            "mongodb" => {
+                // The stored URI keeps hosts, path and options; credentials go back in.
+                let url = self.param("url")?;
+                let (scheme, rest) = url.split_once("://")?;
+                Some(format!("{scheme}://{}{rest}", userinfo(self.param("user"))))
+            }
+            driver => {
+                let scheme = match driver {
+                    "postgres" => "postgres",
+                    "mysql" => "mysql",
+                    "mssql" => "sqlserver",
+                    "redis" => "redis",
+                    "mqtt" => "mqtt",
+                    _ => return None,
+                };
+                let host = self.param("host").unwrap_or("localhost");
+                // IPv6 literals need brackets in a URL.
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                };
+                let port = self
+                    .param("port")
+                    .map(|p| format!(":{p}"))
+                    .unwrap_or_default();
+                let db = self
+                    .param("database")
+                    .map(|d| format!("/{}", percent_encode(d)))
+                    .unwrap_or_default();
+                const IN_URL: &[&str] = &["host", "port", "user", "password", "database"];
+                let query: Vec<String> = self
+                    .params
+                    .iter()
+                    .filter(|(k, v)| {
+                        !IN_URL.contains(&k.as_str())
+                            && !crate::store::SECRET_KEYS.contains(&k.as_str())
+                            && !v.is_empty()
+                    })
+                    .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+                    .collect();
+                let query = if query.is_empty() {
+                    String::new()
+                } else {
+                    format!("?{}", query.join("&"))
+                };
+                Some(format!(
+                    "{scheme}://{}{host}{port}{db}{query}",
+                    userinfo(self.param("user"))
+                ))
+            }
+        }
+    }
+}
+
+/// Percent-encodes everything but the URL-safe characters `A-Z a-z 0-9 - . _ ~`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn split_host_port(s: &str) -> (&str, Option<&str>) {
     if let Some(rest) = s.strip_prefix('[') {
         // IPv6 literal: [::1]:5432
@@ -195,6 +284,32 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_url_round_trips() {
+        for url in [
+            "postgres://app@db.example.com:5432/shop?sslmode=require",
+            "mysql://root@localhost:3306/app",
+            "sqlite:/tmp/app.db",
+            "sqlite::memory:",
+            "mongodb://ann@h1:27017,h2:27017/shop?replicaSet=rs0",
+        ] {
+            let c = ConnectionConfig::from_url(url).unwrap();
+            assert_eq!(c.to_url(None).as_deref(), Some(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn to_url_adds_an_encoded_password_only_when_asked() {
+        let c = ConnectionConfig::from_url("postgres://u%40x:p%40ss@h/db").unwrap();
+        assert_eq!(c.to_url(None).as_deref(), Some("postgres://u%40x@h/db"));
+        let with = c.to_url(Some("p@ss w/\"x")).unwrap();
+        assert_eq!(with, "postgres://u%40x:p%40ss%20w%2F%22x@h/db");
+        // What we write, we read back.
+        let back = ConnectionConfig::from_url(&with).unwrap();
+        assert_eq!(back.param("password"), Some("p@ss w/\"x"));
+        assert_eq!(back.param("user"), Some("u@x"));
+    }
 
     #[test]
     fn parses_postgres_url() {
@@ -237,6 +352,20 @@ mod tests {
         let c = ConnectionConfig::from_url("mongodb+srv://cluster0.example.net").unwrap();
         assert_eq!(c.param("url"), Some("mongodb+srv://cluster0.example.net"));
         assert_eq!(c.param("database"), None);
+    }
+
+    #[test]
+    fn redis_and_mqtt_urls() {
+        let r = ConnectionConfig::from_url("redis://:s3cret@cache:6380/2").unwrap();
+        assert_eq!(r.driver, "redis");
+        assert_eq!(r.param("password"), Some("s3cret"));
+        assert_eq!(r.param("database"), Some("2"));
+        assert_eq!(r.to_url(None).as_deref(), Some("redis://cache:6380/2"));
+        let m = ConnectionConfig::from_url("mqtt://broker.local").unwrap();
+        assert_eq!(
+            (m.driver.as_str(), m.param("host")),
+            ("mqtt", Some("broker.local"))
+        );
     }
 
     #[test]

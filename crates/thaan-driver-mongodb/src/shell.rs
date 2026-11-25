@@ -75,6 +75,12 @@ pub enum Op {
     DropCollection {
         coll: String,
     },
+    /// `db.c.renameCollection("new", dropTarget?)`, in the same database.
+    RenameCollection {
+        coll: String,
+        to: String,
+        drop_target: bool,
+    },
     CreateCollection {
         name: String,
         options: Document,
@@ -155,6 +161,7 @@ impl Op {
             Op::CreateIndex { .. } => "createIndex",
             Op::GetIndexes { .. } => "getIndexes",
             Op::DropCollection { .. } => "drop",
+            Op::RenameCollection { .. } => "renameCollection",
             Op::CreateCollection { .. } => "createCollection",
             Op::ListCollections => "getCollectionNames",
             Op::ListDatabases => "show dbs",
@@ -707,6 +714,14 @@ pub fn parse(input: &str) -> ParseResult<Op> {
         },
         "getIndexes" => Op::GetIndexes { coll },
         "drop" => Op::DropCollection { coll },
+        "renameCollection" => Op::RenameCollection {
+            coll,
+            to: match a(0) {
+                Some(Bson::String(s)) if !s.is_empty() => s.clone(),
+                _ => return Err("renameCollection expects the new name".into()),
+            },
+            drop_target: matches!(a(1), Some(Bson::Boolean(true))),
+        },
         other => return Err(format!("unsupported method `.{other}()`")),
     };
 
@@ -922,6 +937,11 @@ mod tests {
             }
         ));
         assert!(!parse("db.u.aggregate([{$match: {}}])").unwrap().is_write());
+        assert!(matches!(
+            parse("db.getCollection('u').renameCollection('v')").unwrap(),
+            Op::RenameCollection { ref to, drop_target: false, .. } if to == "v"
+        ));
+        assert!(parse("db.u.renameCollection('v')").unwrap().is_write());
         assert!(parse("db.u.aggregate([{$match: {}}, {$out: 'x'}])")
             .unwrap()
             .is_write());

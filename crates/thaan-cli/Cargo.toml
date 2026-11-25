@@ -9,11 +9,15 @@ name = "thaan"
 path = "src/main.rs"
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mongodb"]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "mqtt", "keychain"]
+# Reads the passwords the desktop app saved, so saved connections open from the CLI / MCP.
+keychain = ["dep:thaan-keychain"]
 sqlite = ["dep:thaan-driver-sqlite"]
 postgres = ["dep:thaan-driver-postgres"]
 mysql = ["dep:thaan-driver-mysql"]
 mongodb = ["dep:thaan-driver-mongodb"]
+redis = ["dep:thaan-driver-redis"]
+mqtt = ["dep:thaan-driver-mqtt"]
 
 [dependencies]
 thaan-core.workspace = true
@@ -21,5 +25,8 @@ thaan-driver-sqlite = { workspace = true, optional = true }
 thaan-driver-postgres = { workspace = true, optional = true }
 thaan-driver-mysql = { workspace = true, optional = true }
 thaan-driver-mongodb = { workspace = true, optional = true }
+thaan-driver-redis = { workspace = true, optional = true }
+thaan-driver-mqtt = { workspace = true, optional = true }
+thaan-keychain = { workspace = true, optional = true }
 serde_json.workspace = true
 anyhow.workspace = true

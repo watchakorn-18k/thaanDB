@@ -541,6 +541,11 @@ impl Render for DocDialog {
 impl ThaanApp {
     /// The document selected in the active collection tab (table row or tree item).
     pub(super) fn selected_doc(&self, cx: &App) -> Option<Doc> {
+        self.selected_doc_ref(cx).cloned()
+    }
+
+    /// The selected document without copying it (for render-time checks).
+    pub(super) fn selected_doc_ref(&self, cx: &App) -> Option<&Doc> {
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return None;
         };
@@ -556,12 +561,23 @@ impl ThaanApp {
             }
             _ => t.docs.read(cx).selected()?,
         };
-        docs.get(ix).cloned()
+        docs.get(ix)
     }
 
     pub(super) fn open_doc_dialog(
         &mut self,
         kind: DocDialogKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_doc_dialog_with(kind, None, window, cx)
+    }
+
+    /// `prefill` replaces the empty Insert template (Clone row puts a copy there).
+    pub(super) fn open_doc_dialog_with(
+        &mut self,
+        kind: DocDialogKind,
+        prefill: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -571,7 +587,10 @@ impl ThaanApp {
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return;
         };
-        let id = self.selected_doc(cx).and_then(|d| d.get("_id").cloned());
+        // Insert starts from nothing; the others act on the selected document.
+        let id = (kind != DocDialogKind::Insert)
+            .then(|| self.selected_doc(cx).and_then(|d| d.get("_id").cloned()))
+            .flatten();
         if matches!(kind, DocDialogKind::View | DocDialogKind::Edit) && id.is_none() {
             return self.set_status("Select a document first", true, cx);
         }
@@ -586,7 +605,7 @@ impl ThaanApp {
         let dialog = cx.new(|_| DocDialog {
             kind,
             engine: self.engine.clone(),
-            session_id: session.session_id,
+            session_id: t.sid,
             app,
             tab_ix: self.active,
             place: format!("{} / {}", session.name, collection),
@@ -608,7 +627,9 @@ impl ThaanApp {
             inserted: 0,
         });
         dialog.update(cx, |d, cx| match kind {
-            DocDialogKind::Insert => d.set_text(INSERT_TEMPLATE, window, cx),
+            DocDialogKind::Insert => {
+                d.set_text(prefill.as_deref().unwrap_or(INSERT_TEMPLATE), window, cx)
+            }
             DocDialogKind::Delete => {
                 let scope = d.scope;
                 d.set_scope(scope, window, cx);
@@ -619,6 +640,94 @@ impl ThaanApp {
             let title = dialog.read(cx).title();
             modal.title(title).w(px(760.)).child(dialog.clone())
         });
+    }
+
+    /// Asks before deleting the selected document, then runs `deleteOne({ _id })` off the
+    /// UI thread and reloads the page.
+    pub(super) fn confirm_delete_selected_doc(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(id) = self.selected_doc(cx).and_then(|d| d.get("_id").cloned()) else {
+            return self.set_status("Select a document first", true, cx);
+        };
+        let (sid, tab_ix, collection) = (t.sid, self.active, t.object.name.clone());
+        let this = cx.entity();
+        let shown = id.summary();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let id = id.clone();
+            let collection = collection.clone();
+            alert
+                .confirm()
+                .title("Delete this document?")
+                .description(SharedString::from(format!(
+                    "_id {shown} will be removed from {collection}. This cannot be undone."
+                )))
+                .ok_text("Delete")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    this.update(cx, |app, cx| {
+                        app.delete_doc(sid, tab_ix, collection.clone(), id.clone(), cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    fn delete_doc(
+        &mut self,
+        session_id: SessionId,
+        tab_ix: usize,
+        collection: String,
+        id: Doc,
+        cx: &mut Context<Self>,
+    ) {
+        let req = QueryRequest {
+            session_id,
+            sql: format!(
+                "{}.deleteOne({{ _id: {} }})",
+                collection_expr(&collection),
+                id.to_pretty()
+            ),
+            scope: RunScope::All,
+            params: BTreeMap::new(),
+        };
+        self.set_status("Deleting document…", false, cx);
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.run_query(&req) })
+                .await;
+            this.update(cx, |app, cx| {
+                let first = match res {
+                    Err(e) => return app.set_status(format!("Delete failed: {e}"), true, cx),
+                    Ok(r) => r.into_iter().next(),
+                };
+                if let Some(e) = first.as_ref().and_then(|s| s.error.clone()) {
+                    return app.set_status(format!("Delete failed: {e}"), true, cx);
+                }
+                let n = first
+                    .and_then(|s| s.result)
+                    .and_then(|r| r.rows_affected)
+                    .unwrap_or(0);
+                if n == 0 {
+                    app.set_status("Nothing deleted: the document is already gone", true, cx);
+                } else {
+                    app.set_status("Document deleted", false, cx);
+                }
+                if app.active == tab_ix {
+                    app.load_page(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Insert · View · Edit · Delete as icon buttons, with the selected `_id` on the right.

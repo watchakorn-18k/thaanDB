@@ -66,7 +66,7 @@ These rules make principle 9 concrete. A change that breaks one is not done.
 
 - Under about 100 ms: no indicator, just show the result (a flash of a spinner reads as lag).
 - Over about 100 ms: show a state right where the content will appear, said in words:
-  `Connecting to shop-prod…`, `Running query…`, `Loading 100 rows…`, `Exporting…`.
+  `Connecting to shop-prod…`, `Running query…`, `Loading 50 rows…`, `Exporting…`.
   Use a skeleton for grids, lists and the schema tree, a spinner or progress text for
   buttons and the status bar, a progress count for exports and imports.
 - Keep the previous content visible while refreshing instead of blanking it.
@@ -76,7 +76,7 @@ These rules make principle 9 concrete. A change that breaks one is not done.
 ### Keep memory small
 
 - Never load a whole table or an unbounded result into memory. Tables are paged
-  (`PageRequest`, 100 rows by default). Query results get a row cap with a clear
+  (`PageRequest`, 50 rows by default in the app). Query results get a row cap with a clear
   "first N rows" note and a way to fetch more.
 - Exports and imports stream row by row to and from disk; they never build the whole file
   as one `String` or `Vec`.
@@ -115,7 +115,9 @@ crates/
   thaan-driver-postgres/ PostgreSQL (`postgres` crate; text-format params, binary decode)
   thaan-driver-mysql/  MySQL / MariaDB (`mysql` crate, pure-Rust features)
   thaan-driver-mongodb/ MongoDB (official crate, sync API; `shell.rs` parses shell syntax)
-  thaan-cli/           `thaan` binary: headless access to every command
+  thaan-keychain/      OS keychain `SecretStore`, shared by the app and the CLI
+  thaan-cli/           `thaan` binary: headless access to every command; `thaan mcp`
+                       is the MCP server (protocol in `thaan_core::mcp`)
   thaan-app/           GPUI desktop app (gpui-component widgets)
 docs/
   clean-room.md        what sources are allowed
@@ -132,7 +134,9 @@ cargo build --workspace                      # everything
 cargo test --workspace --exclude thaan-app     # engine + drivers + CLI tests (fast, headless)
 cargo run -p thaan-cli -- commands             # list every CommandId
 cargo run -p thaan-cli -- query sqlite::memory: "select 1"
+cargo run -p thaan-cli -- mcp                   # MCP server on stdio (docs/mcp.md)
 cargo run -p thaan-app                         # desktop app
+scripts/dev-watch.sh                           # desktop app, rebuilt and restarted on save
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
@@ -171,8 +175,9 @@ cargo fmt --all
 
 - Rust 2021, `anyhow` at binary edges, `thiserror` (`thaan_core::Error`) in libraries.
 - No `unwrap()` / `expect()` outside tests, except on invariants with a comment.
-- No secrets in logs, config files or test fixtures. Passwords go to the OS keychain (todo);
-  until then they are kept only in memory.
+- No secrets in logs, config files or test fixtures. Passwords go to the OS keychain
+  through `thaan_core::secrets::SecretStore` (the app's `keychain` feature); the store
+  file strips them (`store::SECRET_KEYS`). Without a secret store they stay in memory.
 - Keep PRs focused; every PR description states: *"Clean-room: written from docs/spec and
   public docs only."*
 - Licence: Apache-2.0 (`LICENSE`). PR, commit and sign-off rules are in `CONTRIBUTING.md`;

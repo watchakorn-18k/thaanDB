@@ -12,8 +12,9 @@ use crate::driver::{Driver, DriverInfo, Session};
 use crate::export::{self, ExportOptions};
 use crate::params;
 use crate::schema::{ObjectRef, SchemaObject, TableInfo};
+use crate::secrets::SecretStore;
 use crate::splitter::{self, Statement};
-use crate::store::{new_id, now_ms, HistoryEntry, SavedQuery, Store};
+use crate::store::{new_id, now_ms, HistoryEntry, SavedQuery, Store, SECRET_KEYS};
 use crate::table::{self, PageRequest, StagedChange};
 use crate::{Error, Result, ResultSet, Value};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,13 @@ impl OpenSession {
         // A panic in a driver poisons only that session; keep using it.
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseList {
+    pub current: Option<String>,
+    pub databases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +120,13 @@ pub struct Engine {
     store: Mutex<Store>,
     sessions: Mutex<HashMap<SessionId, Arc<OpenSession>>>,
     next_session: AtomicU64,
+    /// Keeps passwords between runs (the OS keychain in the app); `None` keeps them in
+    /// memory only.
+    secrets: Option<Arc<dyn SecretStore>>,
+    /// What this run already read from or wrote to `secrets` (misses too), so the OS
+    /// keychain is asked at most once per connection and key per run: each read can
+    /// show a system prompt.
+    secret_cache: Mutex<HashMap<(String, String), Option<String>>>,
 }
 
 impl Engine {
@@ -121,6 +136,80 @@ impl Engine {
             store: Mutex::new(store),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            secrets: None,
+            secret_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Saves connection secrets in `secrets` and reads them back when a saved
+    /// connection opens without them.
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    /// The stored secret `key` of saved connection `connection_id`, if any. Can block
+    /// on the OS keychain; call it off the UI thread.
+    pub fn secret(&self, connection_id: &str, key: &str) -> Option<String> {
+        if connection_id.is_empty() {
+            return None;
+        }
+        let store = self.secrets.as_ref()?;
+        let slot = (connection_id.to_string(), key.to_string());
+        if let Some(v) = self.secret_cache().get(&slot) {
+            return v.clone();
+        }
+        let v = store.get(connection_id, key);
+        self.secret_cache().insert(slot, v.clone());
+        v
+    }
+
+    fn secret_cache(&self) -> MutexGuard<'_, HashMap<(String, String), Option<String>>> {
+        self.secret_cache.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Writes a secret to the store and the run's cache.
+    fn put_secret(&self, connection_id: &str, key: &str, value: &str) -> Result<()> {
+        let Some(store) = &self.secrets else {
+            return Ok(());
+        };
+        store.set(connection_id, key, value)?;
+        self.secret_cache().insert(
+            (connection_id.to_string(), key.to_string()),
+            Some(value.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Fills secrets a saved connection is missing (an empty password box means "use
+    /// the stored one"). Returns the keys the caller typed itself.
+    fn fill_secrets(&self, c: &mut ConnectionConfig) -> Vec<&'static str> {
+        let mut typed = Vec::new();
+        for k in SECRET_KEYS {
+            if c.param(k).is_some() {
+                typed.push(*k);
+            } else if let Some(v) = self.secret(&c.id, k) {
+                c.params.insert((*k).to_string(), v);
+            }
+        }
+        typed
+    }
+
+    /// After a successful connect: remembers secrets typed for a saved connection, so
+    /// the next run does not ask again.
+    fn remember_secrets(&self, c: &ConnectionConfig, typed: &[&str]) {
+        if self.secrets.is_none()
+            || typed.is_empty()
+            || !self.store().data.connections.iter().any(|x| x.id == c.id)
+        {
+            return;
+        }
+        for k in typed {
+            if let Some(v) = c.param(k) {
+                if self.secret(&c.id, k).as_deref() != Some(v) {
+                    self.put_secret(&c.id, k, v).ok();
+                }
+            }
         }
     }
 
@@ -187,12 +276,31 @@ impl Engine {
         if c.id.is_empty() {
             c.id = new_id();
         }
-        let mut s = self.store();
-        match s.data.connections.iter_mut().find(|x| x.id == c.id) {
-            Some(x) => *x = c.clone(),
-            None => s.data.connections.push(c.clone()),
+        {
+            let mut s = self.store();
+            match s.data.connections.iter_mut().find(|x| x.id == c.id) {
+                Some(x) => *x = c.clone(),
+                None => s.data.connections.push(c.clone()),
+            }
+            s.save()?;
         }
-        s.save()?;
+        // A secret typed in the form goes to the keychain; an empty one keeps what is
+        // stored, so editing other fields never drops a saved password.
+        for k in SECRET_KEYS {
+            if let Some(v) = c.param(k) {
+                // Unchanged since this run read or wrote it: no keychain call at all.
+                if self
+                    .secret_cache()
+                    .get(&(c.id.clone(), (*k).to_string()))
+                    .cloned()
+                    .flatten()
+                    .as_deref()
+                    != Some(v)
+                {
+                    self.put_secret(&c.id, k, v)?;
+                }
+            }
+        }
         Ok(c)
     }
 
@@ -203,7 +311,16 @@ impl Engine {
         if s.data.connections.len() == before {
             return Err(Error::UnknownConnection(id.into()));
         }
-        s.save()
+        s.save()?;
+        drop(s);
+        if let Some(store) = &self.secrets {
+            for k in SECRET_KEYS {
+                store.delete(id, k);
+                self.secret_cache()
+                    .insert((id.to_string(), (*k).to_string()), None);
+            }
+        }
+        Ok(())
     }
 
     // ---- connection groups ------------------------------------------------------------
@@ -323,9 +440,11 @@ impl Engine {
 
     pub fn test_connection(&self, c: &ConnectionConfig) -> TestResult {
         let t = Instant::now();
+        let mut c = c.clone();
+        self.fill_secrets(&mut c);
         let r = self
             .driver(&c.driver)
-            .and_then(|d| d.connect(c))
+            .and_then(|d| d.connect(&c))
             .and_then(|mut s| s.ping());
         TestResult {
             ok: r.is_ok(),
@@ -337,9 +456,11 @@ impl Engine {
     // ---- sessions ---------------------------------------------------------------------
 
     /// Opens a session from a full config (it does not need to be saved).
-    pub fn open(&self, c: ConnectionConfig) -> Result<SessionInfo> {
+    pub fn open(&self, mut c: ConnectionConfig) -> Result<SessionInfo> {
         let driver = self.driver(&c.driver)?;
+        let typed = self.fill_secrets(&mut c);
         let inner = driver.connect(&c)?;
+        self.remember_secrets(&c, &typed);
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let info = SessionInfo {
             session_id: id,
@@ -478,10 +599,212 @@ impl Engine {
         session.execute(&sql, &bound)
     }
 
+    /// Runs one statement or driver command without adding it to history: for views
+    /// that poll or act on the user's behalf (the broker console, the key browser).
+    /// Read-only connections refuse writes as in `run_query`.
+    pub fn driver_command(&self, id: SessionId, text: &str) -> Result<ResultSet> {
+        let s = self.session(id)?;
+        let mut sess = s.lock();
+        let t = Instant::now();
+        let mut rs = self.exec_one(&s, sess.as_mut(), text, &BTreeMap::new())?;
+        rs.elapsed_ms = t.elapsed().as_millis() as u64;
+        rs.sql = text.to_string();
+        Ok(rs)
+    }
+
+    // ---- key-value and broker views ---------------------------------------------------
+
+    pub fn scan_keys(
+        &self,
+        id: SessionId,
+        scan: &crate::browse::KeyScan,
+    ) -> Result<crate::browse::KeyPage> {
+        self.session(id)?
+            .lock()
+            .scan_keys(scan)
+            .unwrap_or_else(|| Err(Error::Unsupported("key browsing on this connection".into())))
+    }
+
+    pub fn messages_since(
+        &self,
+        id: SessionId,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::browse::BrokerMessage>> {
+        self.session(id)?
+            .lock()
+            .messages_since(since, limit)
+            .unwrap_or_else(|| Err(Error::Unsupported("messages on this connection".into())))
+    }
+
+    pub fn subscriptions(&self, id: SessionId) -> Result<Vec<crate::browse::Subscription>> {
+        self.session(id)?.lock().subscriptions().unwrap_or_else(|| {
+            Err(Error::Unsupported(
+                "subscriptions on this connection".into(),
+            ))
+        })
+    }
+
     // ---- schema -----------------------------------------------------------------------
 
     pub fn list_objects(&self, id: SessionId) -> Result<Vec<SchemaObject>> {
         self.session(id)?.lock().list_objects()
+    }
+
+    /// The server's databases and the one this session uses.
+    pub fn list_databases(&self, id: SessionId) -> Result<DatabaseList> {
+        let s = self.session(id)?;
+        let mut sess = s.lock();
+        let current = sess.current_database()?;
+        let mut databases = sess.list_databases()?;
+        if let Some(c) = &current {
+            if !databases.contains(c) {
+                databases.push(c.clone());
+                databases.sort();
+            }
+        }
+        Ok(DatabaseList { current, databases })
+    }
+
+    /// Objects of any database on the server. Other databases are read through a short
+    /// read-only connection of their own, since some servers (PostgreSQL) cannot look
+    /// across databases from one connection.
+    pub fn list_objects_in(&self, id: SessionId, database: &str) -> Result<Vec<SchemaObject>> {
+        let s = self.session(id)?;
+        if s.lock().current_database()?.as_deref() == Some(database) {
+            return s.lock().list_objects();
+        }
+        let mut cfg = s.connection.clone();
+        cfg.params.insert("database".into(), database.to_string());
+        cfg.read_only = true;
+        let mut tmp = self.driver(&cfg.driver)?.connect(&cfg)?;
+        tmp.list_objects()
+    }
+
+    /// Reopens the session on another database of the same server. The old session is
+    /// closed; the returned session replaces it.
+    pub fn switch_database(&self, id: SessionId, database: &str) -> Result<SessionInfo> {
+        let info = self.open_database(id, database)?;
+        self.close(id).ok();
+        Ok(info)
+    }
+
+    /// Opens another session on the same server, on `database`; session `id` stays open.
+    /// Lets one connection show tables of several databases side by side.
+    pub fn open_database(&self, id: SessionId, database: &str) -> Result<SessionInfo> {
+        let mut cfg = self.session(id)?.connection.clone();
+        // Names made from a URL read `db@host`; keep them truthful. Typed names stay.
+        if let Some(old) = cfg.params.get("database") {
+            if let Some(rest) = cfg.name.strip_prefix(&format!("{old}@")) {
+                cfg.name = format!("{database}@{rest}");
+            }
+        }
+        cfg.params.insert("database".into(), database.to_string());
+        self.open(cfg)
+    }
+
+    /// (read-only, dialect) of an open session.
+    pub(crate) fn session_info_of(&self, id: SessionId) -> Result<(bool, Dialect)> {
+        let s = self.session(id)?;
+        Ok((s.connection.read_only, s.dialect))
+    }
+
+    /// The exact statements `run_object_op` would run, for a preview before confirming.
+    pub fn object_op_statements(
+        &self,
+        id: SessionId,
+        kind: crate::schema::ObjectKind,
+        object: &ObjectRef,
+        op: &crate::object_ops::ObjectOp,
+    ) -> Result<Vec<String>> {
+        let s = self.session(id)?;
+        crate::object_ops::statements(&s.dialect, kind, object, op)
+    }
+
+    /// The exact statements `run_structure_op` would run, for the preview.
+    pub fn structure_op_statements(
+        &self,
+        id: SessionId,
+        table: &ObjectRef,
+        op: &crate::structure_ops::StructureOp,
+    ) -> Result<Vec<String>> {
+        let s = self.session(id)?;
+        crate::structure_ops::statements(&s.dialect, table, op)
+    }
+
+    /// Adds or drops a column, index or foreign key of a SQL table. Refused on read-only
+    /// connections; statements run in order, stop at the first error and go to history.
+    pub fn run_structure_op(
+        &self,
+        id: SessionId,
+        table: &ObjectRef,
+        op: &crate::structure_ops::StructureOp,
+    ) -> Result<()> {
+        let (read_only, dialect) = {
+            let s = self.session(id)?;
+            (s.connection.read_only, s.dialect)
+        };
+        if read_only {
+            return Err(Error::ReadOnly(format!("{} on {}", op.verb(), table.name)));
+        }
+        let statements = self.structure_op_statements(id, table, op)?;
+        let run = |sql: String| -> Result<()> {
+            let results = self.run_query(&QueryRequest {
+                session_id: id,
+                sql,
+                scope: RunScope::All,
+                params: BTreeMap::new(),
+            })?;
+            match results.into_iter().find_map(|r| r.error) {
+                Some(e) => Err(Error::Database(e)),
+                None => Ok(()),
+            }
+        };
+        // PostgreSQL and SQLite roll DDL back, so a change of several statements (a
+        // rename plus a new type) lands whole or not at all. MySQL commits each one.
+        let atomic = statements.len() > 1 && matches!(dialect.name, "postgres" | "sqlite");
+        if atomic {
+            run("BEGIN".into())?;
+        }
+        for sql in statements {
+            if let Err(e) = run(sql) {
+                if atomic {
+                    run("ROLLBACK".into()).ok();
+                }
+                return Err(e);
+            }
+        }
+        if atomic {
+            run("COMMIT".into())?;
+        }
+        Ok(())
+    }
+
+    /// Renames, drops, truncates or duplicates a table, view or collection. Refused on
+    /// read-only connections. Statements run in order and stop at the first error; each
+    /// is recorded in history like a typed query.
+    pub fn run_object_op(
+        &self,
+        id: SessionId,
+        kind: crate::schema::ObjectKind,
+        object: &ObjectRef,
+        op: &crate::object_ops::ObjectOp,
+    ) -> Result<()> {
+        if self.session(id)?.connection.read_only {
+            return Err(Error::ReadOnly(format!("{} {}", op.verb(), object.name)));
+        }
+        for sql in self.object_op_statements(id, kind, object, op)? {
+            let results = self.run_query(&QueryRequest {
+                session_id: id,
+                sql,
+                scope: RunScope::All,
+                params: BTreeMap::new(),
+            })?;
+            if let Some(e) = results.into_iter().find_map(|r| r.error) {
+                return Err(Error::Database(e));
+            }
+        }
+        Ok(())
     }
 
     pub fn describe_table(&self, id: SessionId, t: &ObjectRef) -> Result<TableInfo> {
@@ -652,6 +975,23 @@ impl Engine {
         s.data.history.clear();
         s.save()
     }
+
+    // ---- settings ---------------------------------------------------------------------
+
+    pub fn settings(&self) -> crate::store::Settings {
+        self.store().data.settings.clone().clamped()
+    }
+
+    /// Stores new settings (out-of-range values are clamped) and trims history to the
+    /// new limit. Returns what was stored. Writes the store file: call it off the UI thread.
+    pub fn set_settings(&self, settings: crate::store::Settings) -> Result<crate::store::Settings> {
+        let settings = settings.clamped();
+        let mut s = self.store();
+        s.data.settings = settings.clone();
+        s.trim_history();
+        s.save()?;
+        Ok(settings)
+    }
 }
 
 fn first_word(sql: &str) -> String {
@@ -708,6 +1048,68 @@ pub fn is_read_statement(sql: &str) -> bool {
         return !writes.iter().any(|k| lower.contains(k));
     }
     true
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use crate::secrets::MemorySecrets;
+
+    /// A driver that never connects; saving only checks that the driver exists.
+    struct NullDriver;
+    impl Driver for NullDriver {
+        fn info(&self) -> DriverInfo {
+            DriverInfo {
+                id: "null".into(),
+                name: "Null".into(),
+                params: Vec::new(),
+            }
+        }
+        fn dialect(&self) -> Dialect {
+            Dialect::for_driver("sqlite")
+        }
+        fn connect(&self, _: &ConnectionConfig) -> Result<Box<dyn Session>> {
+            Err(Error::Unsupported("null driver".into()))
+        }
+    }
+
+    fn engine(secrets: Arc<MemorySecrets>) -> Engine {
+        let e = Engine::new(Store::in_memory()).with_secrets(secrets);
+        e.register_driver(Arc::new(NullDriver));
+        e
+    }
+
+    #[test]
+    fn password_goes_to_secrets_and_comes_back() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let e = engine(secrets.clone());
+        let mut c = ConnectionConfig {
+            name: "db".into(),
+            driver: "null".into(),
+            ..Default::default()
+        };
+        c.params.insert("password".into(), "s3cret".into());
+        let saved = e.save_connection(c).unwrap();
+        assert_eq!(
+            secrets.get(&saved.id, "password").as_deref(),
+            Some("s3cret")
+        );
+
+        // Editing without retyping the password keeps the stored one.
+        let mut edit = saved.clone();
+        edit.params.remove("password");
+        edit.name = "renamed".into();
+        e.save_connection(edit.clone()).unwrap();
+        assert_eq!(e.secret(&saved.id, "password").as_deref(), Some("s3cret"));
+
+        let mut filled = edit;
+        e.fill_secrets(&mut filled);
+        assert_eq!(filled.param("password"), Some("s3cret"));
+
+        e.delete_connection(&saved.id).unwrap();
+        assert_eq!(secrets.get(&saved.id, "password"), None);
+        assert_eq!(e.secret(&saved.id, "password"), None);
+    }
 }
 
 #[cfg(test)]
@@ -788,5 +1190,44 @@ mod tests {
             "with x as (delete from t returning *) select * from x"
         ));
         assert!(is_read_statement("with x as (select 1) select * from x"));
+    }
+}
+
+#[cfg(test)]
+mod secret_cache_tests {
+    use super::*;
+    use crate::secrets::SecretStore;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Counts reads, like a keychain that shows a prompt on each one.
+    #[derive(Default)]
+    struct Counting {
+        reads: AtomicUsize,
+    }
+    impl SecretStore for Counting {
+        fn get(&self, _: &str, key: &str) -> Option<String> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            (key == "password").then(|| "pw".to_string())
+        }
+        fn set(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _: &str, _: &str) {}
+    }
+
+    #[test]
+    fn keychain_is_read_once_per_connection_and_key() {
+        let store = Arc::new(Counting::default());
+        let e = Engine::new(Store::in_memory()).with_secrets(store.clone());
+        for _ in 0..3 {
+            let mut c = ConnectionConfig {
+                id: "c1".into(),
+                ..Default::default()
+            };
+            e.fill_secrets(&mut c);
+            assert_eq!(c.param("password"), Some("pw"));
+        }
+        // One read per secret key, however many times the connection opens.
+        assert_eq!(store.reads.load(Ordering::Relaxed), SECRET_KEYS.len());
     }
 }

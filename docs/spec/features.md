@@ -14,41 +14,46 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Connection list | Saved connections with name, colour label, driver, host/db; grouped in folders | `connection.list` | engine+gui |
+| Connection list | Saved connections with name, colour label, driver, host/db; grouped in folders. The colour is picked freely in the connection form | `connection.list` | engine+gui |
+| Connection colour | The open session's colour fills the bottom status bar, text in black or white for contrast | (connection field `color`) | gui |
 | Connection groups | Create and delete groups (folders) of saved connections; move a connection into or out of a group by menu or drag and drop, and reorder by drag; deleting a group keeps its connections (home.md) | `connection.listFolders`, `connection.createFolder`, `connection.deleteFolder`, `connection.moveToFolder` | engine+gui |
 | New / edit / delete connection | Form generated from the driver's parameter schema | `connection.save`, `connection.delete` | engine+gui |
 | Test connection | Connect, run a trivial query (`ping` for MongoDB), report latency or error | `connection.test` | engine+gui |
 | Driver picker | Buttons for every registered driver; the form below is rebuilt from the chosen driver's parameters | — | gui |
 | Connect off the UI thread | Connect, Test and schema loading run on a background thread; the buttons show "Connecting…" and are disabled meanwhile, and the window stays responsive | — | gui |
-| Connect / disconnect | Opens a session; several sessions can be open at once | `connection.open`, `connection.close` | engine+gui |
+| Connect / disconnect | Opens a session; several sessions can be open at once. The sidebar lists every saved connection; clicking one connects it without closing the others, and an open one shows a green dot and its logo in its colour (workspace.md §1a) | `connection.open`, `connection.close` | engine+gui |
 | Connection URL import | Paste `postgres://…` / `mysql://…` / `sqlite:…` to fill the form | `connection.parseUrl` | engine+gui |
 | SSH tunnel | Host, port, user, password or key file, optional bastion | `connection.sshTunnel` | todo |
-| TLS options | Require/verify, CA / client cert / key files | (connection params) | todo |
+| TLS options | `sslmode` as in libpq: `prefer` (default: TLS when offered, plain otherwise), `disable`, `allow`, `require` (encrypt, certificate not checked), `verify-ca` (trusted chain), `verify-full` (trusted chain and host name); `sslrootcert` adds a CA file to the system roots. Pasting a URL fills the form fields, `?sslmode=` included | (connection params `sslmode`, `sslrootcert`) | engine+gui on PostgreSQL (rustls; client certificates todo; MySQL todo) |
 | Read-only mode | Session refuses writes; UI shows a badge | (connection param `readOnly`) | engine+gui |
-| Secrets storage | Passwords stored in the OS keychain, never in the config file | — | todo |
+| Secrets storage | Passwords (and SSH secrets) stored in the OS keychain, never in the config file: Keychain on macOS, Credential Manager on Windows, Secret Service on Linux (`keychain` feature of the app). Save writes them; a successful connect with a typed password remembers it; an empty password box means "use the stored one", and the edit form fills it from the keychain; deleting a connection removes them. The keychain is read at most once per connection and key per run (cached in memory), so its system prompt does not repeat on every connect. On macOS the app reads and writes these entries through Apple's `/usr/bin/security` tool, so no Keychain prompt appears, also after a rebuild or update; the trade-off is that any program running as the same user can read them through that tool | — (`Engine::with_secrets`, `secrets::SecretStore`) | engine+gui (CLI todo) |
 
 ### Drivers
 
 | Driver | Crate | Status |
 | --- | --- | --- |
 | SQLite | `thaan-driver-sqlite` (rusqlite, feature-gated C) | engine+gui |
-| PostgreSQL / CockroachDB / Redshift | `thaan-driver-postgres` (`postgres` crate, pure Rust; TLS todo) | engine+gui (tested live on PostgreSQL 17) |
+| PostgreSQL / CockroachDB / Redshift | `thaan-driver-postgres` (`postgres` crate, rustls for TLS) | engine+gui (tested live on PostgreSQL 17) |
 | MySQL / MariaDB / TiDB | `thaan-driver-mysql` (`mysql` crate, pure Rust; TLS todo) | engine+gui (tested live on MySQL 8.4) |
 | MongoDB | `thaan-driver-mongodb` (official `mongodb` crate, sync API) | engine+gui (tested live on MongoDB 7) |
+| Redis | `thaan-driver-redis` (own RESP2 client on `std::net`, no TLS yet) | engine+gui (tested live on Redis 7) |
+| MQTT 3.1.1 | `thaan-driver-mqtt` (own client on `std::net`, no TLS yet) | engine+gui (tested live on Mosquitto 2) |
 | SQL Server | `thaan-driver-mssql` (tiberius) | todo |
-| ClickHouse, DuckDB, LibSQL, Oracle, Firebird, Redis, Cassandra, BigQuery | one crate each | todo |
+| ClickHouse, DuckDB, LibSQL, Oracle, Firebird, Cassandra, BigQuery | one crate each | todo |
+| Kafka, RabbitMQ (AMQP), NATS | one crate each, same model as MQTT | todo |
 
 ## 2. Schema browser (sidebar)
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Database / schema picker | Switch database or schema of the active session, from the top of the sidebar (workspace.md §1) | `schema.listDatabases`, `schema.setDatabase` | todo |
+| Database / schema picker | Every database of the server sits in the sidebar tree (connection → database → folders → objects); opening an object in another database opens a second session for that database and keeps the first (workspace.md §1a) | `schema.listDatabases`, `schema.setDatabase` | engine+gui |
 | Object tree | Tables, views, materialized views, routines, triggers, sequences; grouped by schema, lazy-loaded (workspace.md §2) | `schema.listObjects` | engine+gui (eager, not lazy) |
 | Columns under a table | Expand a table to see columns with types, PK/FK markers (workspace.md §2) | `schema.describeTable` | engine; gui shows them in the Structure view, not in the tree |
 | Filter | Type to filter the tree by name | (GUI-local) | gui |
 | Pin / favourite tables | Pinned items listed at the top | `schema.pin` | todo |
-| Context menu | Open data, open structure, copy name, generate SELECT/INSERT, drop, truncate, export | (dispatches other commands) | todo |
+| Context menu | Right-click a table, view or collection: open data or structure, new query, copy (name, qualified name, SELECT, CREATE), refresh, export (CSV, JSON, SQL INSERT), rename, duplicate, truncate, drop. Rename / duplicate / truncate / drop open one dialog that asks first; truncate and drop say they cannot be undone and use the danger button; read-only connections refuse them in the engine (workspace.md §1a) | `table.previewOp`, `table.rename`, `table.duplicate`, `table.truncate`, `table.drop` (+ commands it dispatches) | engine+gui+cli (export still writes on the UI thread, gap 2) |
 | Refresh | Reload schema metadata | `schema.refresh` | engine+gui |
+| New table / collection | Right-click a database: *Add collection* (MongoDB, by name) or *New table* (a CREATE TABLE template in the database's dialect, opened in a query tab on that database) | `collection.create` | engine+gui+cli |
 
 ## 3. Query editor
 
@@ -73,7 +78,9 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | --- | --- | --- | --- |
 | Virtualized grid | Millions of rows scroll smoothly; column resize; row-number gutter; headers show type and PK mark (workspace.md §4) | (GUI) | gui (gutter, header types and PK mark done) |
 | Row count, duration, affected rows | Shown in the single bottom status bar with paging, refresh and last-fetched time (workspace.md §5) | — | engine+gui |
-| Copy | Whole result as CSV / JSON / Markdown / SQL INSERT (cell/selection copy todo) | `result.export` | engine+gui |
+| Copy | Whole result as CSV / JSON / Markdown / SQL INSERT; one cell or one row: click a row number to select the row, ⌘C copies it as TSV (pastes into Excel / Google Sheets cells; NULL is an empty cell), and right-clicking the row number offers Copy row, Copy row with column names, Copy row as JSON and Delete row (multi-row selection todo) | `result.export` | engine+gui |
+| Cell and row menu | Right-click a cell: Set to NULL; Quick filter ▸ (= value, ≠ value, contains for text, > and < otherwise, is NULL / is not NULL); Copy value (⌘C), Copy column name; Paste (⌘V, the first value on the clipboard, staged like an edit) and Edit cell; then the row actions, which a row number's menu has too: copy the row for spreadsheets (TSV, with or without column names), as JSON, as Markdown or as SQL INSERT; Clone row (⌘D: a copy at the end of the grid, every value but the primary key, inserted on Apply; on MongoDB a prefilled Insert document dialog without `_id`); Delete row (⌫, staged, toggles back); See row / See document. Menu rows show their shortcut keys | `table.stageChange`, `result.export` | gui |
+| Rows per page | A box in the status bar: type any size (1–1000) or pick 1, 5, 10, 25, 50, 100 or 200 from its list; going back to page 1 and reloading. 50 when a table opens | `table.fetchPage` (`pageSize`) | gui |
 | JSON / long text viewer | Side panel shows the selected cell formatted | (GUI) | todo |
 | Export | CSV, TSV, JSON, JSON Lines, SQL INSERT, Markdown, Excel | `result.export` | engine (no Excel) |
 
@@ -83,7 +90,8 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | --- | --- | --- | --- |
 | Open table | Paged rows (default 100), server-side sort and filter | `table.fetchPage` | engine+gui (header sort runs on the server for table tabs) |
 | Filter builder | Column + operator + value rows, or raw `WHERE` (workspace.md §3) | `table.fetchPage` (filters) | engine+gui (MongoDB tabs keep the raw query box) |
-| Inline edit | Edit cells, add rows, delete rows; changes staged and highlighted | `table.stageChange` | todo |
+| Inline edit | Double-click a cell to edit (relational tables); right-click a row to stage its deletion (every database, row shown red); edited cells are tinted; Reset / N Apply in the status bar. Add row: the + in the status bar (or ⌘N) adds an empty row at the end of the grid, marked "+" in the gutter, with its first non-key cell open for typing; only typed cells are inserted on Apply, so column defaults fill the rest; Discard removes it. On MongoDB the same + opens the Insert document dialog. Row bar (SQL tables, like MongoDB's document bar): under the filter, ghost icon buttons Add row · View row (a dialog of column / value pairs) · Edit cell (opens the selected cell, or the first non-key one) · Delete row (staged, toggles back), with "Row N" / "New row" / "No row selected" on the right; on read-only connections only View works | `table.stageChange`, `table.applyChanges` | gui |
+| Command box | Table tabs open a resizable command editor with line numbers and a ready command (`SELECT … LIMIT 100` or `db.getCollection(…).find({})`); ⌘↵ runs it into the grid; hideable | `query.runAll` | gui |
 | Apply / discard | Apply staged changes in one transaction, or preview the SQL | `table.applyChanges`, `table.previewChanges` | engine |
 | Set NULL / default | Per-cell actions | (staged change) | todo |
 
@@ -91,10 +99,10 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
-| Columns | Add, rename, change type, nullable, default; preview DDL before applying | `structure.alterColumns` | todo |
-| Indexes | List, create, drop | `structure.indexes` | todo |
-| Foreign keys | List, create, drop | `structure.relations` | todo |
-| Triggers | List, view definition | `structure.triggers` | todo |
+| Columns | List (name, type, nullable, default, comment, primary-key position) in the Structure view's Columns tab; add (name, type, nullable, default), drop, and rename / change type, NULL and default in one form, each with the exact SQL shown first. Only what changed is altered; MySQL restates the column with its comment and AUTO_INCREMENT kept; on PostgreSQL and SQLite a change of several statements runs in one transaction. SQLite can rename but not change a type, NULL or default | `schema.describeTable`; `structure.preview`, `structure.apply` (`addColumn`, `dropColumn`, `alterColumn`) | engine+gui+cli |
+| Indexes | List (name, unique, primary, columns); create (name, ordered columns, unique) and drop (not the primary key's index), SQL shown first | `schema.describeTable` (`indexes`); `structure.preview`, `structure.apply` (`createIndex`, `dropIndex`) | engine+gui+cli (SQLite, PostgreSQL, MySQL) |
+| Foreign keys | List (name, columns, referenced schema/table/columns, ON UPDATE, ON DELETE); add (name optional, columns, referenced table and columns, actions) and drop, SQL shown first. SQLite cannot add or drop one on an existing table and says so | `schema.describeTable` (`foreignKeys`); `structure.preview`, `structure.apply` (`addForeignKey`, `dropForeignKey`) | engine+gui+cli (PostgreSQL, MySQL; SQLite list only) |
+| Triggers | List (name, timing, event, action, WHEN condition); full definition in the DDL tab | `schema.describeTable` (`triggers`) | engine+gui (SQLite, PostgreSQL, MySQL) |
 | Create table | Form-based table creation with DDL preview | `structure.createTable` | todo |
 | DDL view | Show `CREATE` statement for any object | `structure.ddl` | engine+gui (SQLite) |
 
@@ -105,6 +113,7 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | Export table(s) | Whole table or filtered rows, many formats, to file | `export.table` | engine+gui (CSV/JSON to ~/Downloads; file picker todo) |
 | Import CSV | Map CSV columns to table columns, preview, insert in batches | `import.csv` | todo |
 | Backup / restore | Wrap native dump tools when present (`pg_dump`, `mysqldump`) | `backup.*` | todo |
+| Data transfer | Copy tables or collections from one connection and database to another, any engine to any engine (workspace.md §9). Copy structure and rows, structure only, or rows only into existing tables; an existing target table is appended to, emptied first, or dropped and recreated. Structure comes from the source's columns with types mapped to the target's dialect (keys and NOT NULL kept; defaults, indexes and foreign keys not). Rows go one page (500) at a time, so memory stays at one page; progress after every batch; Stop ends it at the next batch; a read-only target is refused. Opened from a database's right-click menu (it starts from that database) or the palette | `data.transfer` | engine+gui (saved transfer tasks todo) |
 
 ## 8. Workspace & app
 
@@ -112,7 +121,8 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | --- | --- | --- | --- |
 | Command palette | Fuzzy search over every registered command | `app.commandPalette` | gui |
 | Keyboard shortcuts | Configurable, stored in settings | — | todo |
-| Themes | Light / dark toggle (system mode todo) | `app.toggleTheme` | gui |
+| Themes | Light / dark / system, saved; toggle in the rail | `app.toggleTheme` | gui |
+| Settings | Dialog: theme, text size, rows per page, history size; saved in the store | `app.settings`, `settings.get`, `settings.set` | done |
 | Multiple windows | One window per workspace | — | todo |
 | Team workspaces / sync | Optional self-hostable sync of connections and saved queries (no secrets) | `workspace.*` | todo |
 | Entity-relationship diagram | Auto-layout diagram of tables and FKs | `schema.erDiagram` | todo |
@@ -134,9 +144,39 @@ No other client's code or binaries were studied (see `docs/clean-room.md`).
 | Edit documents | Staged `$set` / insert / delete by `_id`, previewed as shell commands; applied one by one (no transaction without a replica set) | `table.previewChanges`, `table.applyChanges` | engine (gui editing todo, as for SQL) |
 | Read-only | The driver refuses writes, including `$out` / `$merge` aggregations and non-read `runCommand`s | — | engine |
 
+## 9a. Redis
+
+Written from the Redis protocol spec and command reference. No other client's code was studied.
+
+| Feature | Behaviour | CommandId | Status |
+| --- | --- | --- | --- |
+| Connect | Host, port, optional ACL user, password, database number; `redis://:pw@host:6379/2` fills the form | `connection.open` | engine+gui |
+| Databases | `db0`…`dbN` (from `CONFIG GET databases`, 16 when the server refuses CONFIG) | `schema.listDatabases` | engine+gui |
+| Key browser | A database row in the tree opens a key browser tab (no folders under it): pattern box (`SCAN MATCH`), type picker (`SCAN TYPE`), keys with type and TTL loaded 200 at a time (TYPE and TTL pipelined, one round trip per batch), *Load more*, at most 10,000 kept; the picked key's contents on the right a page at a time, with copy name, reload and delete (asks first). Other databases open on a second session. (table-view.md T6) | `keys.scan`, `table.fetchPage`, `session.command` | engine+gui |
+| Keys as objects | `schema.listObjects` still returns the first 1000 keys `SCAN` finds, for the CLI and MCP | `schema.listObjects` | engine+cli |
+| Key view | Rows by type: string `value`; hash `field · value`; list `index · value`; set `member`; sorted set `member · score` (sort score descending uses `ZREVRANGE`); stream `id · fields`. Paged with `LRANGE` / `ZRANGE` / `XRANGE` / `*SCAN`, never read whole. Filter rows take `=` or `like` on the first column (becomes `MATCH`), the raw box takes a glob | `table.fetchPage` | engine+gui |
+| Commands | One command per line (quotes and `\xHH` escapes); replies shaped as tables (`HGETALL` → field/value, `INFO` → section/key/value, `SCAN` shows the next cursor in the header); results capped at 10,000 rows; `SUBSCRIBE` / `MONITOR` refused | `query.runAll`, `query.runCurrent` | engine+gui |
+| Edit keys | Staged edits become `SET … KEEPTTL`, `HSET` / `HDEL`, `LSET` / `RPUSH` / `LREM`, `SADD` / `SREM`, `ZADD` / `ZREM`, `XADD` / `XDEL`, previewed as commands and run in one `MULTI` / `EXEC` | `table.previewChanges`, `table.applyChanges` | engine+gui |
+| Key operations | Rename is `RENAMENX` (never overwrites), drop is `DEL`, duplicate is `COPY`; "DDL" lists type, size, TTL, encoding and the commands that recreate the first 100 items | `table.rename`, `table.drop`, `table.previewOp`, `structure.ddl` | engine+gui |
+| Read-only | Only read commands run (`GET`, `HGETALL`, `SCAN`, `INFO`, `CONFIG GET`…) | — | engine |
+
+## 9b. MQTT
+
+Written from the MQTT 3.1.1 OASIS standard. No other client's code was studied.
+
+| Feature | Behaviour | CommandId | Status |
+| --- | --- | --- | --- |
+| Connect | Host, port, user, password, topic filter to subscribe to (`#` by default), client id, messages kept (1000 by default); keep-alive pings in the background | `connection.open` | engine+gui |
+| Console | The connection's one row in the tree, *Console*, opens a console tab: subscriptions on the left (QoS, unsubscribe, add a filter with QoS 0/1); messages received and sent, newest first, polled every 500 ms from the session buffer (ids after the last one seen), with All / Received / Sent, a payload and topic search, Pause and Clear; the picked message in full with copy; a publish panel (topic, payload, QoS 0/1, retain). Times are local. (table-view.md T7) | `broker.messages`, `broker.subscriptions`, `session.command` | engine+gui |
+| Topics as objects | `schema.listObjects` returns the subscribed filter and every topic seen, for the CLI and MCP | `schema.listObjects` | engine+cli |
+| Topic view | Buffered messages, newest first: `received_at · topic · payload · qos · retain · bytes`; a wildcard object (`a/+/t`) shows every match; filter rows run in memory on the bounded buffer; payloads over 256 KiB are cut | `table.fetchPage` | engine+gui |
+| Commands | `PUBLISH topic payload [QOS 0\|1] [RETAIN]`, `SUBSCRIBE filter [QOS n]`, `UNSUBSCRIBE filter`, `MESSAGES [filter] [limit]`, `TOPICS`, `CLEAR`, `HELP` | `query.runAll` | engine+gui |
+| Publish from the grid | Adding a row publishes it (topic defaults to the open topic); deleting a retained row clears it (empty retained publish); messages cannot be edited | `table.applyChanges` | engine+gui |
+| Read-only | Refuses `PUBLISH` and grid writes | — | engine |
+
 ## 10. Headless access
 
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
 | CLI | `thaan query/tables/describe/ddl/export/run` | every id above | engine |
-| MCP server | Expose the command registry as MCP tools | every id above | todo |
+| MCP server | `thaan mcp` speaks MCP over stdio (see `docs/mcp.md`). Tools: `list_connections`, `add_connection`, `query`, `list_databases`, `list_tables`, `describe_table`, `fetch_rows`, `disconnect`, plus `list_commands` / `run_command` for every id above. `connection` is a saved name or id or a URL and opens on first use; no permission setup, read-only connections stay read-only in the engine. Query replies are capped (200 rows by default, `maxRows` up to 5000), long text cells shortened. Settings › MCP shows the server path and a ready config for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Windsurf | every id above | engine+gui |

@@ -1,0 +1,10 @@
+[package]
+name = "thaan-driver-redis"
+description = "Redis driver (own RESP2 client over std TCP)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thaan-core.workspace = true
+serde_json.workspace = true

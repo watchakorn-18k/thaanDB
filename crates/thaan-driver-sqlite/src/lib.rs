@@ -7,7 +7,7 @@ use thaan_core::connection::ConnectionConfig;
 use thaan_core::dialect::Dialect;
 use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
 use thaan_core::schema::{
-    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
+    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo, TriggerInfo,
 };
 use thaan_core::{Column, Error, Result, ResultSet, Value};
 
@@ -145,6 +145,22 @@ impl Session for SqliteSession {
         self.query(sql, params)
     }
 
+    /// `main` plus any attached databases.
+    fn list_databases(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .texts(
+                "SELECT name FROM pragma_database_list WHERE name <> 'temp'",
+                &[],
+            )?
+            .iter()
+            .map(|r| text(&r[0]))
+            .collect())
+    }
+
+    fn current_database(&mut self) -> Result<Option<String>> {
+        Ok(Some("main".into()))
+    }
+
     fn list_objects(&mut self) -> Result<Vec<SchemaObject>> {
         let rows = self.texts(
             "SELECT type, name, tbl_name FROM sqlite_schema \
@@ -193,11 +209,14 @@ impl Session for SqliteSession {
                     Value::Int(n) if n > 0 => Some(n as u32),
                     _ => None,
                 },
+                comment: None,
+                auto_increment: false,
             })
             .collect();
 
         let fk_rows = self.texts(
-            "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?) ORDER BY id, seq",
+            "SELECT id, \"table\", \"from\", \"to\", on_update, on_delete \
+             FROM pragma_foreign_key_list(?) ORDER BY id, seq",
             std::slice::from_ref(&name),
         )?;
         let mut foreign_keys: Vec<(i64, ForeignKey)> = Vec::new();
@@ -211,16 +230,20 @@ impl Session for SqliteSession {
                 None => foreign_keys.push((
                     id,
                     ForeignKey {
+                        name: None,
                         columns: vec![text(&r[2])],
+                        ref_schema: None,
                         ref_table: text(&r[1]),
                         ref_columns: vec![text(&r[3])],
+                        on_update: Some(text(&r[4])),
+                        on_delete: Some(text(&r[5])),
                     },
                 )),
             }
         }
 
         let idx_rows = self.texts(
-            "SELECT name, \"unique\" FROM pragma_index_list(?)",
+            "SELECT name, \"unique\", origin FROM pragma_index_list(?)",
             std::slice::from_ref(&name),
         )?;
         let mut indexes = Vec::new();
@@ -234,14 +257,27 @@ impl Session for SqliteSession {
                 name: iname,
                 columns: cols.iter().map(|c| text(&c[0])).collect(),
                 unique: r[1] == Value::Int(1),
+                // `pk`: the index SQLite made for a PRIMARY KEY constraint.
+                primary: text(&r[2]) == "pk",
             });
         }
+
+        let trigger_rows = self.texts(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? \
+             ORDER BY name",
+            std::slice::from_ref(&name),
+        )?;
+        let triggers = trigger_rows
+            .iter()
+            .map(|r| parse_trigger(text(&r[0]), &text(&r[1])))
+            .collect();
 
         Ok(TableInfo {
             object: t.clone(),
             columns,
             foreign_keys: foreign_keys.into_iter().map(|(_, f)| f).collect(),
             indexes,
+            triggers,
         })
     }
 
@@ -296,6 +332,154 @@ mod tests {
         let r = e.run_query(&req).unwrap();
         assert!(r.iter().all(|x| x.error.is_none()), "{r:?}");
         (e, s.session_id)
+    }
+
+    #[test]
+    fn transfer_between_databases() {
+        use std::sync::atomic::AtomicBool;
+        use thaan_core::schema::ObjectRef;
+        use thaan_core::transfer::{ExistingTable, TransferContent, TransferRequest};
+        let (e, source) = engine();
+        // 1,203 rows so the copy takes several batches.
+        let more: Vec<String> = (0..1200).map(|i| format!("('u{i}', {i})")).collect();
+        e.run_query(&QueryRequest {
+            session_id: source,
+            sql: format!("insert into users (name, age) values {}", more.join(",")),
+            scope: RunScope::All,
+            params: Default::default(),
+        })
+        .unwrap();
+        let target = e
+            .open(ConnectionConfig::from_url("sqlite::memory:").unwrap())
+            .unwrap()
+            .session_id;
+        let count = |sid, t: &str| {
+            let r = e
+                .run_query(&QueryRequest {
+                    session_id: sid,
+                    sql: format!("select count(*) from {t}"),
+                    scope: RunScope::All,
+                    params: Default::default(),
+                })
+                .unwrap();
+            r[0].result.as_ref().map(|rs| rs.rows[0][0].clone())
+        };
+        let users = ObjectRef {
+            schema: None,
+            name: "users".into(),
+        };
+        let mut req = TransferRequest {
+            source,
+            target,
+            tables: vec![users.clone()],
+            content: TransferContent::StructureAndData,
+            existing: ExistingTable::Append,
+            batch_size: 500,
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let never = AtomicBool::new(false);
+        let r = e
+            .transfer(&req, &|p| seen.borrow_mut().push(p.rows_done), &never)
+            .unwrap();
+        assert_eq!((r.tables, r.rows), (1, 1203));
+        assert_eq!(*seen.borrow(), vec![500, 1000, 1203]);
+        assert_eq!(count(target, "users"), Some(Value::Int(1203)));
+        // Truncate empties first; Replace rebuilds; Append adds to what is there.
+        req.content = TransferContent::DataOnly;
+        req.existing = ExistingTable::Truncate;
+        e.transfer(&req, &|_| {}, &never).unwrap();
+        assert_eq!(count(target, "users"), Some(Value::Int(1203)));
+        req.content = TransferContent::StructureOnly;
+        req.existing = ExistingTable::Replace;
+        e.transfer(&req, &|_| {}, &never).unwrap();
+        assert_eq!(count(target, "users"), Some(Value::Int(0)));
+        req.content = TransferContent::DataOnly;
+        req.existing = ExistingTable::Append;
+        e.transfer(&req, &|_| {}, &never).unwrap();
+        assert_eq!(count(target, "users"), Some(Value::Int(1203)));
+        // Appending the same keys again stops with the database's error.
+        assert!(e.transfer(&req, &|_| {}, &never).is_err());
+        req.content = TransferContent::StructureOnly;
+        req.existing = ExistingTable::Replace;
+        e.transfer(&req, &|_| {}, &never).unwrap();
+        // Cancelled before it starts: nothing copied.
+        req.content = TransferContent::StructureAndData;
+        req.existing = ExistingTable::Append;
+        let r = e.transfer(&req, &|_| {}, &AtomicBool::new(true)).unwrap();
+        assert!(r.cancelled);
+        assert_eq!(count(target, "users"), Some(Value::Int(0)));
+        // Data only into a table the target does not have is refused.
+        req.content = TransferContent::DataOnly;
+        req.tables = vec![ObjectRef {
+            schema: None,
+            name: "posts".into(),
+        }];
+        assert!(e.transfer(&req, &|_| {}, &never).is_err());
+    }
+
+    #[test]
+    fn object_ops_rename_duplicate_truncate_drop() {
+        use thaan_core::object_ops::ObjectOp;
+        use thaan_core::schema::{ObjectKind, ObjectRef};
+        let (e, sid) = engine();
+        let t = |n: &str| ObjectRef {
+            schema: None,
+            name: n.into(),
+        };
+        let count = |table: &str| {
+            let r = e
+                .run_query(&QueryRequest {
+                    session_id: sid,
+                    sql: format!("select count(*) from {table}"),
+                    scope: RunScope::All,
+                    params: Default::default(),
+                })
+                .unwrap();
+            r[0].result.as_ref().map(|rs| rs.rows[0][0].clone())
+        };
+        let run = |o: &str, op: ObjectOp| e.run_object_op(sid, ObjectKind::Table, &t(o), &op);
+        run(
+            "users",
+            ObjectOp::Rename {
+                to: "people".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(count("people"), Some(Value::Int(3)));
+        run(
+            "people",
+            ObjectOp::Duplicate {
+                to: "people_copy".into(),
+                with_data: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(count("people_copy"), Some(Value::Int(3)));
+        run("people_copy", ObjectOp::Truncate).unwrap();
+        assert_eq!(count("people_copy"), Some(Value::Int(0)));
+        run("people_copy", ObjectOp::Drop).unwrap();
+        assert_eq!(count("people_copy"), None);
+        // A failing statement is reported, not swallowed.
+        assert!(run("missing", ObjectOp::Drop).is_err());
+    }
+
+    #[test]
+    fn object_ops_refused_on_read_only() {
+        use thaan_core::object_ops::ObjectOp;
+        use thaan_core::schema::{ObjectKind, ObjectRef};
+        let e = Engine::new(Store::in_memory());
+        e.register_driver(Arc::new(SqliteDriver));
+        let mut c = ConnectionConfig::from_url("sqlite::memory:").unwrap();
+        c.read_only = true;
+        let s = e.open(c).unwrap();
+        let t = ObjectRef {
+            schema: None,
+            name: "x".into(),
+        };
+        let err = e
+            .run_object_op(s.session_id, ObjectKind::Table, &t, &ObjectOp::Drop)
+            .unwrap_err();
+        assert!(matches!(err, thaan_core::Error::ReadOnly(_)), "{err}");
     }
 
     #[test]
@@ -475,5 +659,73 @@ mod tests {
             .unwrap();
         assert!(err.contains("read-only"), "{err}");
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Splits a stored `CREATE TRIGGER` statement into timing, event, condition and body.
+/// SQLite keeps only the statement text, so this reads its keywords; an unusual
+/// statement still shows its name and the whole text as the action.
+fn parse_trigger(name: String, sql: &str) -> TriggerInfo {
+    let upper = sql.to_ascii_uppercase();
+    // Timing and event sit before `ON <table>`; the body may use the same words.
+    let head = &upper[..upper.find(" ON ").unwrap_or(upper.len())];
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let has = |w: &str| words.contains(&w);
+    let timing = if head.contains("INSTEAD OF") {
+        "INSTEAD OF"
+    } else if has("AFTER") {
+        "AFTER"
+    } else {
+        "BEFORE"
+    };
+    let event = ["INSERT", "UPDATE", "DELETE"]
+        .into_iter()
+        .find(|e| has(e))
+        .unwrap_or("")
+        .to_string();
+    // Byte offsets line up: ASCII upper-casing keeps every char's length.
+    let begin = upper.find("BEGIN");
+    let action = match (begin, upper.rfind("END")) {
+        (Some(b), Some(e)) if e > b => sql[b + 5..e].trim().to_string(),
+        _ => sql.trim().to_string(),
+    };
+    let condition = upper.find(" WHEN ").and_then(|w| {
+        let end = begin.filter(|b| *b > w)?;
+        Some(sql[w + 6..end].trim().to_string()).filter(|c| !c.is_empty())
+    });
+    TriggerInfo {
+        name,
+        timing: timing.to_string(),
+        event,
+        action,
+        condition,
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::parse_trigger;
+
+    #[test]
+    fn reads_trigger_parts() {
+        let t = parse_trigger(
+            "audit".into(),
+            "CREATE TRIGGER audit AFTER UPDATE OF total ON orders FOR EACH ROW \
+             WHEN new.total > 100 BEGIN INSERT INTO log VALUES (new.id); END",
+        );
+        assert_eq!(t.timing, "AFTER");
+        assert_eq!(t.event, "UPDATE");
+        assert_eq!(t.condition.as_deref(), Some("new.total > 100"));
+        assert_eq!(t.action, "INSERT INTO log VALUES (new.id);");
+
+        let t = parse_trigger(
+            "v".into(),
+            "CREATE TRIGGER v INSTEAD OF DELETE ON vw BEGIN SELECT 1; END",
+        );
+        assert_eq!(
+            (t.timing.as_str(), t.event.as_str()),
+            ("INSTEAD OF", "DELETE")
+        );
+        assert_eq!(t.condition, None);
     }
 }

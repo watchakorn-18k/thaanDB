@@ -15,6 +15,9 @@ thaan-driver-sqlite = { path = "crates/thaan-driver-sqlite" }
 thaan-driver-postgres = { path = "crates/thaan-driver-postgres" }
 thaan-driver-mysql = { path = "crates/thaan-driver-mysql" }
 thaan-driver-mongodb = { path = "crates/thaan-driver-mongodb" }
+thaan-driver-redis = { path = "crates/thaan-driver-redis" }
+thaan-driver-mqtt = { path = "crates/thaan-driver-mqtt" }
+thaan-keychain = { path = "crates/thaan-keychain" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -22,6 +25,16 @@ anyhow = "1"
 
 # Principle 9 (AGENTS.md): small, fast release binaries. Thin LTO keeps link times sane
 # with GPUI; one codegen unit and stripped symbols trade build time for speed and size.
+# Faster edit-build-run loops (scripts/dev-watch.sh). Full debug info for GPUI and the
+# other dependencies is most of what the linker writes on every rebuild; our own crates
+# keep line tables, so panics and backtraces still show file and line. For a debugger
+# session with variables, build with CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

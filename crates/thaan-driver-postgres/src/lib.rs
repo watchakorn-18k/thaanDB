@@ -5,16 +5,17 @@
 //! statement expects. Results arrive in binary format and are decoded in [`decode`].
 
 mod decode;
+mod tls;
 
 use bytes::BytesMut;
 use postgres::types::{to_sql_checked, Format, FromSql, IsNull, ToSql, Type};
-use postgres::{Client, NoTls};
+use postgres::Client;
 use std::time::Duration;
 use thaan_core::connection::ConnectionConfig;
 use thaan_core::dialect::Dialect;
 use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
 use thaan_core::schema::{
-    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
+    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo, TriggerInfo,
 };
 use thaan_core::{Column, Error, Result, ResultSet, Value};
 
@@ -31,6 +32,11 @@ impl Driver for PostgresDriver {
                 ParamSpec::new("user", "User", ParamKind::Text).placeholder("postgres"),
                 ParamSpec::new("password", "Password", ParamKind::Password),
                 ParamSpec::new("database", "Database", ParamKind::Text).placeholder("postgres"),
+                ParamSpec::new("sslmode", "SSL mode", ParamKind::Choice)
+                    .choices(tls::MODES)
+                    .default("prefer"),
+                ParamSpec::new("sslrootcert", "CA certificate", ParamKind::File)
+                    .placeholder("PEM file, for verify-ca / verify-full (optional)"),
             ],
         }
     }
@@ -40,13 +46,8 @@ impl Driver for PostgresDriver {
     }
 
     fn connect(&self, c: &ConnectionConfig) -> Result<Box<dyn Session>> {
-        if let Some(mode) = c.param("sslmode") {
-            if !matches!(mode, "disable" | "allow" | "prefer") {
-                return Err(Error::Unsupported(format!(
-                    "sslmode={mode}: TLS connections are not implemented yet"
-                )));
-            }
-        }
+        let root_cert = c.param("sslrootcert");
+        let (ssl_mode, verify) = tls::parse_mode(c.param("sslmode"), root_cert)?;
         let mut cfg = postgres::Config::new();
         cfg.host(c.param("host").unwrap_or("localhost"))
             .port(
@@ -58,11 +59,14 @@ impl Driver for PostgresDriver {
             .user(c.param("user").unwrap_or("postgres"))
             .dbname(c.param("database").unwrap_or("postgres"))
             .application_name("thaandb")
-            .connect_timeout(Duration::from_secs(10));
+            .connect_timeout(Duration::from_secs(10))
+            .ssl_mode(ssl_mode);
         if let Some(pw) = c.param("password") {
             cfg.password(pw);
         }
-        let mut client = cfg.connect(NoTls).map_err(db)?;
+        let mut client = cfg
+            .connect(tls::connector(verify, root_cert)?)
+            .map_err(db)?;
         if c.read_only {
             client
                 .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
@@ -80,7 +84,21 @@ fn db(e: postgres::Error) -> Error {
             Some(detail) => format!("{}: {} ({detail})", d.severity(), d.message()),
             None => format!("{}: {}", d.severity(), d.message()),
         }),
-        None => Error::Database(e.to_string()),
+        None => {
+            // Wrapper errors ("error performing TLS handshake") hide the reason in their
+            // source chain ("invalid peer certificate: UnknownIssuer"); show it.
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                let t = s.to_string();
+                if !msg.contains(&t) {
+                    msg.push_str(": ");
+                    msg.push_str(&t);
+                }
+                src = s.source();
+            }
+            Error::Database(msg)
+        }
     }
 }
 
@@ -100,10 +118,7 @@ impl ToSql for TextParam {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Text(s) => s.clone(),
-            Value::Bytes(b) => format!(
-                "\\x{}",
-                decode::hex(b)
-            ),
+            Value::Bytes(b) => format!("\\x{}", decode::hex(b)),
         };
         out.extend_from_slice(text.as_bytes());
         Ok(IsNull::No)
@@ -223,6 +238,24 @@ impl Session for PgSession {
         self.query(sql, params)
     }
 
+    fn list_databases(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .rows(
+                "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1",
+                &[],
+            )?
+            .iter()
+            .map(|r| text(&r[0]))
+            .collect())
+    }
+
+    fn current_database(&mut self) -> Result<Option<String>> {
+        Ok(self
+            .rows("SELECT current_database()", &[])?
+            .first()
+            .map(|r| text(&r[0])))
+    }
+
     fn list_objects(&mut self) -> Result<Vec<SchemaObject>> {
         let mut out = Vec::new();
         let rels = self.rows(
@@ -308,7 +341,8 @@ impl Session for PgSession {
                     pg_get_expr(d.adbin, d.adrelid), \
                     (SELECT k.ord FROM pg_index i, \
                        unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
-                      WHERE i.indrelid = a.attrelid AND i.indisprimary AND k.attnum = a.attnum) \
+                      WHERE i.indrelid = a.attrelid AND i.indisprimary AND k.attnum = a.attnum), \
+                    col_description(a.attrelid, a.attnum) \
              FROM pg_attribute a \
              LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
              WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
@@ -326,33 +360,45 @@ impl Session for PgSession {
                     Value::Int(n) if n > 0 => Some(n as u32),
                     _ => None,
                 },
+                comment: (!r[5].is_null()).then(|| text(&r[5])),
+                auto_increment: false,
             })
             .collect();
         let fks = self.rows(
             "SELECT (SELECT string_agg(a.attname, chr(31) ORDER BY k.ord) \
                        FROM unnest(con.conkey) WITH ORDINALITY k(attnum, ord) \
                        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum), \
-                    con.confrelid::regclass::text, \
+                    rc.relname, \
                     (SELECT string_agg(a.attname, chr(31) ORDER BY k.ord) \
                        FROM unnest(con.confkey) WITH ORDINALITY k(attnum, ord) \
-                       JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum) \
-             FROM pg_constraint con WHERE con.conrelid = $1::regclass AND con.contype = 'f' \
+                       JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum), \
+                    con.conname, rn.nspname, \
+                    con.confupdtype::text, con.confdeltype::text \
+             FROM pg_constraint con \
+             JOIN pg_class rc ON rc.oid = con.confrelid \
+             JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+             WHERE con.conrelid = $1::regclass AND con.contype = 'f' \
              ORDER BY con.conname",
             std::slice::from_ref(&q),
         )?;
         let foreign_keys = fks
             .iter()
             .map(|r| ForeignKey {
+                name: Some(text(&r[3])),
                 columns: split_list(&r[0]),
+                ref_schema: Some(text(&r[4])),
                 ref_table: text(&r[1]),
                 ref_columns: split_list(&r[2]),
+                on_update: Some(fk_action(&text(&r[5])).to_string()),
+                on_delete: Some(fk_action(&text(&r[6])).to_string()),
             })
             .collect();
         let idx = self.rows(
             "SELECT ic.relname, i.indisunique, \
-                    (SELECT string_agg(a.attname, chr(31) ORDER BY k.ord) \
-                       FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
-                       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) \
+                    (SELECT string_agg(pg_get_indexdef(i.indexrelid, k.ord::int, true), \
+                                       chr(31) ORDER BY k.ord) \
+                       FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)), \
+                    i.indisprimary \
              FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
              WHERE i.indrelid = $1::regclass ORDER BY ic.relname",
             std::slice::from_ref(&q),
@@ -363,6 +409,34 @@ impl Session for PgSession {
                 name: text(&r[0]),
                 columns: split_list(&r[2]),
                 unique: r[1] == Value::Bool(true),
+                primary: r[3] == Value::Bool(true),
+            })
+            .collect();
+        // tgtype bits: 2 BEFORE, 64 INSTEAD OF (else AFTER); 4 INSERT, 8 DELETE,
+        // 16 UPDATE, 32 TRUNCATE.
+        let trg = self.rows(
+            "SELECT t.tgname, \
+                    CASE WHEN t.tgtype & 64 <> 0 THEN 'INSTEAD OF' \
+                         WHEN t.tgtype & 2 <> 0 THEN 'BEFORE' ELSE 'AFTER' END, \
+                    concat_ws(' OR ', \
+                      CASE WHEN t.tgtype & 4 <> 0 THEN 'INSERT' END, \
+                      CASE WHEN t.tgtype & 16 <> 0 THEN 'UPDATE' END, \
+                      CASE WHEN t.tgtype & 8 <> 0 THEN 'DELETE' END, \
+                      CASE WHEN t.tgtype & 32 <> 0 THEN 'TRUNCATE' END), \
+                    'EXECUTE FUNCTION ' || t.tgfoid::regproc::text || '()', \
+                    substring(pg_get_triggerdef(t.oid, true) from 'WHEN \\((.*)\\) EXECUTE') \
+             FROM pg_trigger t \
+             WHERE t.tgrelid = $1::regclass AND NOT t.tgisinternal ORDER BY t.tgname",
+            std::slice::from_ref(&q),
+        )?;
+        let triggers = trg
+            .iter()
+            .map(|r| TriggerInfo {
+                name: text(&r[0]),
+                timing: text(&r[1]),
+                event: text(&r[2]),
+                action: text(&r[3]),
+                condition: (!r[4].is_null()).then(|| text(&r[4])),
             })
             .collect();
         Ok(TableInfo {
@@ -370,6 +444,7 @@ impl Session for PgSession {
             columns,
             foreign_keys,
             indexes,
+            triggers,
         })
     }
 
@@ -488,6 +563,17 @@ impl PgSession {
             out.push_str(&format!("\n\n{};", text(&r[0])));
         }
         Ok(out)
+    }
+}
+
+/// A foreign key's referential action from its `pg_constraint` code.
+fn fk_action(code: &str) -> &'static str {
+    match code {
+        "r" => "RESTRICT",
+        "c" => "CASCADE",
+        "n" => "SET NULL",
+        "d" => "SET DEFAULT",
+        _ => "NO ACTION",
     }
 }
 

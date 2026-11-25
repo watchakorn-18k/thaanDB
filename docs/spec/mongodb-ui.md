@@ -42,7 +42,14 @@ the visual design (colours, icons, spacing, wording) is ThaanDB's own.
 | M6 | Collection view query bar has three inputs: **Filter**, **Projection**, **Sort** (each a query document); Enter in any of them re-runs | gui |
 | M7 | Collection footer reads "Documents a–b of n" | gui |
 | M8 | Hover/click stats for a collection in the sidebar | todo |
-| M9 | Edit a value in the tree or table and stage it as `$set` | todo |
+| M9 | Icon toolbar above the collection view: insert · view · edit · delete (tooltips; write actions disabled on read-only connections), with the selected `_id` on the right | gui |
+| M9a | **Insert** dialog: shell-syntax editor, Validate, Format, Wrap lines, Insert, and "Insert and add another" (inserts, clears, stays open, counts) | gui |
+| M9b | **View** dialog: the full document re-read from the server (never the projected row), read-only, with Edit to switch in place | gui |
+| M9c | **Edit** dialog: same tools as Insert; Update runs `replaceOne({ _id }, doc)`. Documents with values that cannot round-trip as text (binary other than UUID, timestamps, non-finite doubles) open read-only | gui |
+| M9d | **Delete** dialog: scope *Selected document* · *Current filter* · *All documents*, the query shown and editable, a live match count, and a button that says how many go ("Delete 4 documents"); disabled at 0 matches | gui |
+| M9g | With a document selected (table row or cell), the status bar adds **Edit** (`pencil`; **View** with `eye` on a read-only connection) and **Delete** (`trash`) after Insert. Edit opens the M9c dialog. Delete asks first ("Delete this document?", its `_id` and collection, cannot be undone), then runs `deleteOne({ _id })` in the background and reloads the page. Hidden when nothing is selected | gui |
+| M9e | Errors from the server stay in the dialog as the server's own sentence; the text is kept for fixing | gui |
+| M9f | Edit a single value in place in the tree or table | todo |
 | M10 | Connection dialog sections (TLS, SSH, auth mechanism) | todo |
 
 ## Data model

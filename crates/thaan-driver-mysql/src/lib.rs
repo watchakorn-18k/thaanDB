@@ -12,7 +12,7 @@ use thaan_core::connection::ConnectionConfig;
 use thaan_core::dialect::Dialect;
 use thaan_core::driver::{Driver, DriverInfo, ParamKind, ParamSpec, Session};
 use thaan_core::schema::{
-    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo,
+    ColumnInfo, ForeignKey, IndexInfo, ObjectKind, ObjectRef, SchemaObject, TableInfo, TriggerInfo,
 };
 use thaan_core::{Column, Error, Result, ResultSet, Value};
 
@@ -310,6 +310,19 @@ impl Session for MysqlSession {
         self.run("START TRANSACTION", &[]).map(|_| ())
     }
 
+    /// MySQL calls them schemas; they play the part of databases in the tree.
+    fn list_databases(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .rows("SHOW DATABASES", &[])?
+            .iter()
+            .map(|r| text(&r[0]))
+            .collect())
+    }
+
+    fn current_database(&mut self) -> Result<Option<String>> {
+        self.current_db()
+    }
+
     fn list_objects(&mut self) -> Result<Vec<SchemaObject>> {
         let current = self.current_db()?;
         // With a database selected, list only that one and leave objects unqualified.
@@ -387,7 +400,8 @@ impl Session for MysqlSession {
             .map(|r| (text(&r[0]), as_int(&r[1]) as u32))
             .collect();
         let cols = self.rows(
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS \
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT, EXTRA \
+             FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             &key,
         )?;
@@ -398,21 +412,30 @@ impl Session for MysqlSession {
             .iter()
             .map(|r| {
                 let name = text(&r[0]);
+                let (data_type, extra) = (text(&r[1]), text(&r[5]).to_ascii_lowercase());
                 ColumnInfo {
                     primary_key: pk.iter().find(|(n, _)| *n == name).map(|(_, p)| *p),
                     name,
-                    data_type: text(&r[1]),
                     nullable: text(&r[2]) == "YES",
-                    default: (!r[3].is_null()).then(|| text(&r[3])),
+                    default: (!r[3].is_null())
+                        .then(|| default_sql(&text(&r[3]), &data_type, &extra)),
+                    data_type,
+                    // MySQL stores "no comment" as an empty string.
+                    comment: Some(text(&r[4])).filter(|c| !c.is_empty()),
+                    auto_increment: extra.contains("auto_increment"),
                 }
             })
             .collect();
         let mut foreign_keys: Vec<(String, ForeignKey)> = Vec::new();
         for r in self.rows(
-            "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
-             FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
-             ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+            "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, \
+                    k.REFERENCED_COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA, \
+                    rc.UPDATE_RULE, rc.DELETE_RULE \
+             FROM information_schema.KEY_COLUMN_USAGE k \
+             LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS rc \
+               ON rc.CONSTRAINT_SCHEMA = k.TABLE_SCHEMA AND rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME \
+             WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
             &key,
         )? {
             let name = text(&r[0]);
@@ -422,11 +445,15 @@ impl Session for MysqlSession {
                     fk.ref_columns.push(text(&r[3]));
                 }
                 None => foreign_keys.push((
-                    name,
+                    name.clone(),
                     ForeignKey {
+                        name: Some(name),
                         columns: vec![text(&r[1])],
+                        ref_schema: Some(text(&r[4])),
                         ref_table: text(&r[2]),
                         ref_columns: vec![text(&r[3])],
+                        on_update: (!r[5].is_null()).then(|| text(&r[5])),
+                        on_delete: (!r[6].is_null()).then(|| text(&r[6])),
                     },
                 )),
             }
@@ -442,17 +469,36 @@ impl Session for MysqlSession {
             match indexes.iter_mut().find(|i| i.name == name) {
                 Some(i) => i.columns.push(col),
                 None => indexes.push(IndexInfo {
+                    primary: name == "PRIMARY",
                     name,
                     columns: vec![col],
                     unique: as_int(&r[1]) == 0,
                 }),
             }
         }
+        let triggers = self
+            .rows(
+                "SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION, ACTION_STATEMENT \
+                 FROM information_schema.TRIGGERS \
+                 WHERE EVENT_OBJECT_SCHEMA = ? AND EVENT_OBJECT_TABLE = ? ORDER BY TRIGGER_NAME",
+                &key,
+            )?
+            .iter()
+            .map(|r| TriggerInfo {
+                name: text(&r[0]),
+                timing: text(&r[1]),
+                event: text(&r[2]),
+                action: text(&r[3]),
+                // MySQL has no WHEN clause; conditions live inside the body.
+                condition: None,
+            })
+            .collect();
         Ok(TableInfo {
             object: t.clone(),
             columns,
             foreign_keys: foreign_keys.into_iter().map(|(_, f)| f).collect(),
             indexes,
+            triggers,
         })
     }
 
@@ -699,5 +745,40 @@ mod tests {
             "DROP TABLE thaan_posts; DROP TABLE thaan_users; DROP VIEW thaan_v",
             Default::default(),
         );
+    }
+}
+
+/// A column default as SQL. MySQL reports a literal default bare (`OPEN` for `'OPEN'`)
+/// and an expression default with `DEFAULT_GENERATED` in EXTRA; MariaDB quotes literals
+/// itself. Restating a column (MODIFY) needs the SQL form.
+fn default_sql(raw: &str, data_type: &str, extra: &str) -> String {
+    let ty = data_type.to_ascii_lowercase();
+    let numeric = [
+        "int", "decimal", "numeric", "float", "double", "real", "bit", "bool",
+    ]
+    .iter()
+    .any(|n| ty.contains(n));
+    let is_number = raw.parse::<f64>().is_ok();
+    if extra.contains("default_generated") || raw.starts_with('\'') || (numeric && is_number) {
+        raw.to_string()
+    } else {
+        Dialect::MYSQL.literal(&Value::Text(raw.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::default_sql;
+
+    #[test]
+    fn defaults_become_sql() {
+        assert_eq!(default_sql("OPEN", "varchar(10)", ""), "'OPEN'");
+        assert_eq!(default_sql("0.00", "decimal(12,2)", ""), "0.00");
+        assert_eq!(
+            default_sql("CURRENT_TIMESTAMP", "timestamp", "default_generated"),
+            "CURRENT_TIMESTAMP"
+        );
+        assert_eq!(default_sql("'x'", "varchar(3)", ""), "'x'");
+        assert_eq!(default_sql("it's", "text", ""), "'it''s'");
     }
 }

@@ -18,6 +18,8 @@ pub enum Error {
     ReadOnly(String),
     #[error("not supported by this driver: {0}")]
     Unsupported(String),
+    #[error("keychain: {0}")]
+    Secret(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

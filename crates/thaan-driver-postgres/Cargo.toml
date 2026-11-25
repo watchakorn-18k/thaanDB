@@ -9,3 +9,7 @@ license.workspace = true
 thaan-core.workspace = true
 postgres = "0.19"
 bytes = "1"
+# TLS (sslmode). rustls with `ring`, the same stack the MongoDB driver already pulls in.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-native-certs = "0.8"
+tokio-postgres-rustls = "0.13"

@@ -3,6 +3,8 @@
 //! Everything a user can do is a command registered in [`commands`] and executed by
 //! [`engine::Engine`]. The GUI, CLI and MCP are clients of this crate.
 
+pub mod browse;
+pub mod cmdline;
 pub mod commands;
 pub mod connection;
 pub mod dialect;
@@ -11,12 +13,17 @@ pub mod driver;
 pub mod engine;
 pub mod error;
 pub mod export;
+pub mod mcp;
+pub mod object_ops;
 pub mod params;
 pub mod result;
 pub mod schema;
+pub mod secrets;
 pub mod splitter;
 pub mod store;
+pub mod structure_ops;
 pub mod table;
+pub mod transfer;
 pub mod value;
 
 pub use error::{Error, Result};

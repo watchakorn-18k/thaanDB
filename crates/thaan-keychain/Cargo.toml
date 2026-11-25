@@ -1,0 +1,17 @@
+[package]
+name = "thaan-keychain"
+description = "Connection secrets in the OS keychain, shared by the desktop app and the CLI / MCP server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thaan-core.workspace = true
+
+# The OS keychain: Credential Manager on Windows, Secret Service (pure-Rust D-Bus) on
+# Linux. macOS goes through Apple's /usr/bin/security tool instead (src/lib.rs).
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3.6.3", features = ["async-secret-service", "crypto-rust", "async-io"] }

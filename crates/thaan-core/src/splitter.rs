@@ -16,6 +16,10 @@ pub struct SplitOptions {
     pub delimiter_command: bool,
     /// `[identifier]` (SQL Server, SQLite).
     pub bracket_identifiers: bool,
+    /// One statement per line, no terminator (Redis and MQTT commands). Blank lines and
+    /// `#` comment lines (with `hash_comments`) are skipped.
+    #[serde(default)]
+    pub line_statements: bool,
 }
 
 impl Default for SplitOptions {
@@ -26,6 +30,7 @@ impl Default for SplitOptions {
             hash_comments: false,
             delimiter_command: true,
             bracket_identifiers: true,
+            line_statements: false,
         }
     }
 }
@@ -40,6 +45,9 @@ pub struct Statement {
 }
 
 pub fn split(input: &str, opts: SplitOptions) -> Vec<Statement> {
+    if opts.line_statements {
+        return split_lines(input, opts);
+    }
     let b = input.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
@@ -196,6 +204,26 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
+/// Every non-empty line is one statement.
+fn split_lines(input: &str, opts: SplitOptions) -> Vec<Statement> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    for line in input.split_inclusive('\n') {
+        let lead = line.len() - line.trim_start().len();
+        let t = line.trim();
+        if !t.is_empty() && !(opts.hash_comments && t.starts_with('#')) && !t.starts_with("//") {
+            let start = from + lead;
+            out.push(Statement {
+                sql: t.to_string(),
+                start,
+                end: start + t.len(),
+            });
+        }
+        from += line.len();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +266,20 @@ mod tests {
             sqls("select $tag$ a;b $tag$; select 2"),
             ["select $tag$ a;b $tag$", "select 2"]
         );
+    }
+
+    #[test]
+    fn line_statements() {
+        let o = SplitOptions {
+            line_statements: true,
+            hash_comments: true,
+            ..Default::default()
+        };
+        let s = "SET a 1;x\n\n  # note\nHGETALL \"user 1\"\n";
+        let st = split(s, o);
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[0].sql, "SET a 1;x");
+        assert_eq!(&s[st[1].start..st[1].end], "HGETALL \"user 1\"");
     }
 
     #[test]

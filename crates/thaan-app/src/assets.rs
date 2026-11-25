@@ -29,6 +29,14 @@ const OWN: &[(&str, &[u8])] = &[
         "db-icons/mongodb.svg",
         include_bytes!("../assets/db-icons/mongodb.svg"),
     ),
+    (
+        "db-icons/redis.svg",
+        include_bytes!("../assets/db-icons/redis.svg"),
+    ),
+    (
+        "db-icons/mqtt.svg",
+        include_bytes!("../assets/db-icons/mqtt.svg"),
+    ),
 ];
 
 pub struct Assets;
@@ -61,6 +69,8 @@ pub fn db_logo_path(driver_id: &str) -> Option<&'static str> {
         "mariadb" => "db-icons/mariadb.svg",
         "sqlite" => "db-icons/sqlite.svg",
         "mongodb" => "db-icons/mongodb.svg",
+        "redis" => "db-icons/redis.svg",
+        "mqtt" => "db-icons/mqtt.svg",
         _ => return None,
     })
 }

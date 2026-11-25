@@ -45,6 +45,11 @@ pub enum QueryLanguage {
     /// MongoDB shell-style commands (`db.users.find({...})`): passed to the driver as
     /// typed; the driver enforces read-only itself.
     MongoShell,
+    /// Redis commands, one per line (`HGETALL user:1`): passed to the driver as typed.
+    Redis,
+    /// MQTT client commands, one per line (`PUBLISH sensors/t 21.5`): passed to the
+    /// driver as typed.
+    Mqtt,
 }
 
 /// Describes one query family. Built-in families are available as constants.
@@ -74,6 +79,7 @@ impl Dialect {
             hash_comments: false,
             delimiter_command: false,
             bracket_identifiers: true,
+            line_statements: false,
         },
         supports_returning: true,
         language: QueryLanguage::Sql,
@@ -90,6 +96,7 @@ impl Dialect {
             hash_comments: false,
             delimiter_command: false,
             bracket_identifiers: false,
+            line_statements: false,
         },
         supports_returning: true,
         language: QueryLanguage::Sql,
@@ -106,6 +113,7 @@ impl Dialect {
             hash_comments: true,
             delimiter_command: true,
             bracket_identifiers: false,
+            line_statements: false,
         },
         supports_returning: false,
         language: QueryLanguage::Sql,
@@ -122,6 +130,7 @@ impl Dialect {
             hash_comments: false,
             delimiter_command: false,
             bracket_identifiers: true,
+            line_statements: false,
         },
         supports_returning: false,
         language: QueryLanguage::Sql,
@@ -141,9 +150,48 @@ impl Dialect {
             hash_comments: false,
             delimiter_command: false,
             bracket_identifiers: false,
+            line_statements: false,
         },
         supports_returning: false,
         language: QueryLanguage::MongoShell,
+    };
+
+    /// Redis. Commands are split on lines by the driver; `;` is left alone.
+    pub const REDIS: Dialect = Dialect {
+        name: "redis",
+        quote_open: '"',
+        quote_close: '"',
+        placeholders: PlaceholderStyle::Question,
+        paging: PagingStyle::LimitOffset,
+        split: SplitOptions {
+            dollar_quotes: false,
+            backslash_escapes: true,
+            hash_comments: true,
+            delimiter_command: false,
+            bracket_identifiers: false,
+            line_statements: true,
+        },
+        supports_returning: false,
+        language: QueryLanguage::Redis,
+    };
+
+    /// MQTT broker. Like Redis: line-based client commands.
+    pub const MQTT: Dialect = Dialect {
+        name: "mqtt",
+        quote_open: '"',
+        quote_close: '"',
+        placeholders: PlaceholderStyle::Question,
+        paging: PagingStyle::LimitOffset,
+        split: SplitOptions {
+            dollar_quotes: false,
+            backslash_escapes: true,
+            hash_comments: false,
+            delimiter_command: false,
+            bracket_identifiers: false,
+            line_statements: true,
+        },
+        supports_returning: false,
+        language: QueryLanguage::Mqtt,
     };
 
     pub fn quote_ident(&self, ident: &str) -> String {
@@ -198,12 +246,49 @@ impl Dialect {
         }
     }
 
+    /// A starting CREATE TABLE for a new table named `object`: a generated key, a name
+    /// column and a creation time, in this dialect's types, to edit before running.
+    pub fn create_table_template(&self, object: &ObjectRef) -> String {
+        let t = self.quote_object(object);
+        let (id, text, when) = match self.name {
+            "postgres" => (
+                "bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+                "text NOT NULL",
+                "timestamptz NOT NULL DEFAULT now()",
+            ),
+            "mysql" => (
+                "BIGINT AUTO_INCREMENT PRIMARY KEY",
+                "VARCHAR(255) NOT NULL",
+                "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            ),
+            "mssql" => (
+                "BIGINT IDENTITY PRIMARY KEY",
+                "NVARCHAR(255) NOT NULL",
+                "DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()",
+            ),
+            _ => (
+                "INTEGER PRIMARY KEY",
+                "TEXT NOT NULL",
+                "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            ),
+        };
+        let col = |n: &str| self.quote_ident(n);
+        format!(
+            "CREATE TABLE {t} (\n  {} {id},\n  {} {text},\n  {} {when}\n);\n",
+            col("id"),
+            col("name"),
+            col("created_at")
+        )
+    }
+
     pub fn for_driver(driver: &str) -> Dialect {
         match driver {
             "postgres" | "cockroach" | "redshift" => Dialect::POSTGRES,
             "mysql" | "mariadb" | "tidb" => Dialect::MYSQL,
             "mssql" => Dialect::MSSQL,
             "mongodb" => Dialect::MONGODB,
+            "redis" => Dialect::REDIS,
+            "mqtt" => Dialect::MQTT,
             _ => Dialect::SQLITE,
         }
     }
@@ -223,6 +308,29 @@ mod tests {
             name: "users".into(),
         };
         assert_eq!(Dialect::POSTGRES.quote_object(&o), "\"public\".\"users\"");
+    }
+
+    #[test]
+    fn create_table_templates() {
+        let o = ObjectRef {
+            schema: Some("public".into()),
+            name: "new_table".into(),
+        };
+        let pg = Dialect::POSTGRES.create_table_template(&o);
+        assert!(
+            pg.starts_with("CREATE TABLE \"public\".\"new_table\" (\n  \"id\" bigint GENERATED")
+        );
+        let my = Dialect::MYSQL.create_table_template(&ObjectRef {
+            schema: None,
+            name: "t".into(),
+        });
+        assert!(
+            my.contains("`id` BIGINT AUTO_INCREMENT PRIMARY KEY"),
+            "{my}"
+        );
+        assert!(Dialect::SQLITE
+            .create_table_template(&o)
+            .contains("\"id\" INTEGER PRIMARY KEY"));
     }
 
     #[test]

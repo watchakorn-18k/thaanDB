@@ -104,8 +104,22 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
+/// The server's own sentence when there is one (e.g. `E11000 duplicate key error …`),
+/// instead of the driver's debug dump.
 fn db(e: mongodb::error::Error) -> Error {
-    Error::Database(e.to_string())
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let msg = match e.kind.as_ref() {
+        ErrorKind::Command(c) => Some(c.message.clone()),
+        ErrorKind::Write(WriteFailure::WriteError(w)) => Some(w.message.clone()),
+        ErrorKind::Write(WriteFailure::WriteConcernError(w)) => Some(w.message.clone()),
+        ErrorKind::InsertMany(m) => m
+            .write_errors
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|w| w.message.clone()),
+        _ => None,
+    };
+    Error::Database(msg.unwrap_or_else(|| e.to_string()))
 }
 
 pub struct MongoSession {
@@ -581,6 +595,24 @@ impl MongoSession {
                 coll(&name).drop().run().map_err(db)?;
                 affected(0)
             }
+            Op::RenameCollection {
+                coll: name,
+                to,
+                drop_target,
+            } => {
+                // renameCollection is an admin command taking full `db.collection` names.
+                let db_name = self.db.name().to_string();
+                self.client
+                    .database("admin")
+                    .run_command(bson::doc! {
+                        "renameCollection": format!("{db_name}.{name}"),
+                        "to": format!("{db_name}.{to}"),
+                        "dropTarget": drop_target,
+                    })
+                    .run()
+                    .map_err(db)?;
+                affected(0)
+            }
             Op::CreateCollection { name, options } => {
                 let opts: mongodb::options::CreateCollectionOptions = bson::from_document(options)
                     .map_err(|e| Error::InvalidParams(format!("collection options: {e}")))?;
@@ -654,6 +686,16 @@ impl Session for MongoSession {
         Ok(())
     }
 
+    fn list_databases(&mut self) -> Result<Vec<String>> {
+        let mut names = self.client.list_database_names().run().map_err(db)?;
+        names.sort();
+        Ok(names)
+    }
+
+    fn current_database(&mut self) -> Result<Option<String>> {
+        Ok(Some(self.db.name().to_string()))
+    }
+
     fn list_objects(&mut self) -> Result<Vec<SchemaObject>> {
         let mut out = Vec::new();
         let mut specs: Vec<_> = self
@@ -720,6 +762,8 @@ impl Session for MongoSession {
                 nullable: count < docs.len() || types.contains(&"null"),
                 data_type: types.join(" | "),
                 default: None,
+                comment: None,
+                auto_increment: false,
                 name,
             })
             .collect();
@@ -727,6 +771,7 @@ impl Session for MongoSession {
             .indexes(&t.name)?
             .into_iter()
             .map(|ix| IndexInfo {
+                primary: ix.keys.keys().eq(["_id"].iter()),
                 unique: ix.options.as_ref().and_then(|o| o.unique).unwrap_or(false)
                     || ix.keys.keys().eq(["_id"].iter()),
                 name: ix.options.and_then(|o| o.name).unwrap_or_default(),
@@ -738,6 +783,7 @@ impl Session for MongoSession {
             columns,
             foreign_keys: vec![],
             indexes,
+            triggers: vec![],
         })
     }
 

@@ -52,7 +52,7 @@ pub struct SchemaObject {
     pub parent: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnInfo {
     pub name: String,
@@ -63,22 +63,58 @@ pub struct ColumnInfo {
     /// 1-based position in the primary key, if part of it.
     #[serde(default)]
     pub primary_key: Option<u32>,
+    /// The column's comment, where the database keeps one (not SQLite).
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// MySQL `AUTO_INCREMENT` (PostgreSQL shows a `nextval(…)` default instead).
+    #[serde(default)]
+    pub auto_increment: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForeignKey {
+    /// Constraint name (SQLite foreign keys are often unnamed).
+    #[serde(default)]
+    pub name: Option<String>,
     pub columns: Vec<String>,
+    /// Schema of the referenced table, when the database has schemas.
+    #[serde(default)]
+    pub ref_schema: Option<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
+    /// Referential actions as the database names them (`NO ACTION`, `CASCADE`…).
+    #[serde(default)]
+    pub on_update: Option<String>,
+    #[serde(default)]
+    pub on_delete: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    /// The index behind the primary key.
+    #[serde(default)]
+    pub primary: bool,
+}
+
+/// A trigger on a table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerInfo {
+    pub name: String,
+    /// `BEFORE`, `AFTER` or `INSTEAD OF`.
+    pub timing: String,
+    /// `INSERT`, `UPDATE`, `DELETE` (several joined with ` OR `).
+    pub event: String,
+    /// What it runs: the statement body, or `EXECUTE FUNCTION f()`.
+    pub action: String,
+    /// The `WHEN` condition, if any.
+    #[serde(default)]
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +127,8 @@ pub struct TableInfo {
     pub foreign_keys: Vec<ForeignKey>,
     #[serde(default)]
     pub indexes: Vec<IndexInfo>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerInfo>,
 }
 
 impl TableInfo {

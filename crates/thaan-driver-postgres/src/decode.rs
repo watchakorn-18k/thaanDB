@@ -196,10 +196,11 @@ pub fn numeric(raw: &[u8]) -> Option<String> {
 /// Lower-case hex of `b`, two digits a byte.
 pub(crate) fn hex(b: &[u8]) -> String {
     use std::fmt::Write;
-    b.iter().fold(String::with_capacity(b.len() * 2), |mut s, x| {
-        let _ = write!(s, "{x:02x}"); // writing to a String cannot fail
-        s
-    })
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut s, x| {
+            let _ = write!(s, "{x:02x}"); // writing to a String cannot fail
+            s
+        })
 }
 
 fn uuid(b: &[u8]) -> String {
