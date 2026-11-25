@@ -96,6 +96,57 @@ impl ThaanApp {
         cx.notify();
     }
 
+    /// Asks before deleting a saved connection. Only the saved entry goes; the database is
+    /// not touched, and the dialog says so.
+    pub(super) fn confirm_delete_connection(
+        &mut self,
+        id: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let id = id.clone();
+            alert
+                .confirm()
+                .title(SharedString::from(format!("Delete “{name}”?")))
+                .description(
+                    "This removes the saved connection from ThaanDB. \
+                     The database and its data are not changed.",
+                )
+                .ok_text("Delete")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    this.update(cx, |app, cx| app.delete_connection(id.clone(), cx));
+                    true
+                })
+        });
+    }
+
+    /// Deletes a saved connection off the UI thread (it rewrites the store on disk).
+    fn delete_connection(&mut self, id: String, cx: &mut Context<Self>) {
+        // Drop it from the list at once so the UI answers immediately.
+        self.connections.retain(|c| c.id != id);
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    engine.delete_connection(&id).map(|_| engine.connections())
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(list) => this.connections = list,
+                Err(e) => this.set_status(format!("Delete failed: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The home screen: saved connections on the left, an overview on the right.
     pub(super) fn render_home(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -168,6 +219,7 @@ impl ThaanApp {
                                 .and_then(parse_hex)
                                 .unwrap_or(theme.primary);
                             let id = c.id.clone();
+                            let name = c.name.clone();
                             h_flex()
                                 .id(("home-conn", i))
                                 .flex_none()
@@ -191,11 +243,14 @@ impl ThaanApp {
                                         .xsmall()
                                         .icon(icon("trash"))
                                         .tooltip("Delete connection")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                        .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.engine.delete_connection(&id).ok();
-                                            this.connections = this.engine.connections();
-                                            cx.notify();
+                                            this.confirm_delete_connection(
+                                                id.clone(),
+                                                name.clone(),
+                                                window,
+                                                cx,
+                                            );
                                         })),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
