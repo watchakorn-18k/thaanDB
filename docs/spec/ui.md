@@ -65,3 +65,7 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
   screen, or the open connection's dot, database logo, name and driver), a hairline
   divider, a *New connection* button, and *Commands* with its `Kbd` on the right.
 - The empty parts of the bar drag the window; a double click zooms it like a native bar.
+- On Windows (and Linux with client-side decorations) the same `TitleBar` draws the standard
+  minimise, maximise/restore and close buttons at the right end, after *Commands*. They use
+  the system's own handling (Snap Layouts on maximise, red close on hover). macOS shows the
+  traffic lights on the left instead. Do not draw window buttons by hand.
