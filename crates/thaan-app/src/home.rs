@@ -18,7 +18,17 @@ pub(super) struct HomeState {
     /// Filters the database types in the dialog's first step.
     pub driver_search: Entity<InputState>,
     pub dialog: Option<ConnDialog>,
+    /// Connection groups in display order, cached from the engine (render never asks it).
+    pub folders: Vec<String>,
+    /// Groups the user folded shut in the sidebar (view state only).
+    pub collapsed: std::collections::HashSet<String>,
+    /// Name box of the New group dialog.
+    pub group_name: Entity<InputState>,
+    /// Group picker in the New connection form; item 0 is "No group".
+    pub group_pick: Entity<SelectState<Vec<SharedString>>>,
 }
+
+const NO_GROUP: &str = "No group";
 
 impl HomeState {
     pub fn new(window: &mut Window, cx: &mut Context<ThaanApp>) -> Self {
@@ -29,10 +39,33 @@ impl HomeState {
             cx.subscribe(input, |_, _, _: &InputEvent, cx| cx.notify())
                 .detach();
         }
+        let group_name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
+        cx.subscribe_in(
+            &group_name,
+            window,
+            |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.create_group(window, cx);
+                }
+            },
+        )
+        .detach();
+        let group_pick = cx.new(|cx| {
+            SelectState::new(
+                vec![SharedString::from(NO_GROUP)],
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
         Self {
             filter,
             driver_search,
             dialog: None,
+            folders: Vec::new(),
+            collapsed: Default::default(),
+            group_name,
+            group_pick,
         }
     }
 }
@@ -74,6 +107,12 @@ impl ThaanApp {
     /// view's state on every frame, so step changes and typing show up without reopening.
     pub(super) fn open_conn_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home.dialog = Some(ConnDialog::Pick);
+        let mut items = vec![SharedString::from(NO_GROUP)];
+        items.extend(self.home.folders.iter().cloned().map(SharedString::from));
+        self.home.group_pick.update(cx, |s, cx| {
+            s.set_items(items, window, cx);
+            s.set_selected_index(Some(IndexPath::new(0)), window, cx);
+        });
         self.home.driver_search.update(cx, |s, cx| {
             s.set_value("", window, cx);
             s.focus(window, cx);
@@ -147,6 +186,341 @@ impl ThaanApp {
         .detach();
     }
 
+    /// Opens the New group dialog (a name box and Create).
+    pub(super) fn open_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.home.group_name.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        let this = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let input = this.read(cx).home.group_name.clone();
+            let create = this.clone();
+            dialog
+                .w(px(400.))
+                .title("New group")
+                .child(
+                    v_flex().gap_2().child(Input::new(&input)).child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Right-click a connection to move it into a group"),
+                    ),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("group-cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("group-create")
+                                .primary()
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    create.update(cx, |app, cx| app.create_group(window, cx))
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Creates the group typed in the dialog. Checks the name here so the dialog can stay
+    /// open on a mistake, then saves in the background.
+    fn create_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.home.group_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if self
+            .home
+            .folders
+            .iter()
+            .any(|f| f.to_lowercase() == name.to_lowercase())
+        {
+            self.set_status(format!("A group named “{name}” exists"), true, cx);
+            return;
+        }
+        window.close_dialog(cx);
+        self.home.folders.push(name.clone());
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.create_folder(&name) })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(list) => {
+                    this.home.folders = list;
+                    cx.notify();
+                }
+                Err(e) => this.set_status(format!("Group not created: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks before deleting a group; its connections stay, outside any group.
+    fn confirm_delete_group(
+        &mut self,
+        name: String,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let name = name.clone();
+            alert
+                .confirm()
+                .title(SharedString::from(format!("Delete group “{name}”?")))
+                .description(SharedString::from(match count {
+                    0 => "The group is empty.".to_string(),
+                    1 => "Its connection stays, outside any group.".to_string(),
+                    n => format!("Its {n} connections stay, outside any group."),
+                }))
+                .ok_text("Delete group")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    let name = name.clone();
+                    this.update(cx, |app, cx| app.delete_group(name, cx));
+                    true
+                })
+        });
+    }
+
+    fn delete_group(&mut self, name: String, cx: &mut Context<Self>) {
+        self.home.folders.retain(|f| *f != name);
+        for c in &mut self.connections {
+            if c.folder.as_deref() == Some(name.as_str()) {
+                c.folder = None;
+            }
+        }
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    engine
+                        .delete_folder(&name)
+                        .map(|list| (list, engine.connections()))
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok((folders, conns)) => {
+                    this.home.folders = folders;
+                    this.connections = conns;
+                    cx.notify();
+                }
+                Err(e) => this.set_status(format!("Group not deleted: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Moves a connection into a group, or out of its group with `None`.
+    fn move_to_group(&mut self, id: String, folder: Option<String>, cx: &mut Context<Self>) {
+        if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
+            c.folder = folder.clone();
+        }
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    engine
+                        .move_connection(&id, folder.as_deref())
+                        .map(|_| (engine.folders(), engine.connections()))
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok((folders, conns)) => {
+                    this.home.folders = folders;
+                    this.connections = conns;
+                    cx.notify();
+                }
+                Err(e) => this.set_status(format!("Move failed: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The group chosen in the New connection form, if any.
+    fn picked_group(&self, cx: &App) -> Option<String> {
+        self.home
+            .group_pick
+            .read(cx)
+            .selected_value()
+            .map(|s| s.to_string())
+            .filter(|s| s != NO_GROUP)
+    }
+
+    /// One saved connection in the home sidebar. `indent` puts it under a group header.
+    fn home_conn_row(
+        &self,
+        i: usize,
+        c: &ConnectionConfig,
+        indent: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let color = c
+            .color
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(theme.primary);
+        let id = c.id.clone();
+        let name = c.name.clone();
+        let this = cx.entity();
+        let folders = self.home.folders.clone();
+        let current = c.folder.clone();
+        let menu_id = c.id.clone();
+        let conn = c.clone();
+        h_flex()
+            .id(("home-conn", i))
+            .flex_none()
+            .h(px(ROW_H + 4.))
+            .gap_2()
+            .pr_2()
+            .pl(px(if indent { 28. } else { 8. }))
+            .rounded(px(6.))
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.sidebar_accent))
+            .child(
+                db_icon(&c.driver)
+                    .size_4()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(div().flex_1().truncate().child(c.name.clone()))
+            .child(conn_dot(color))
+            .child(
+                Button::new(("home-del", i))
+                    .ghost()
+                    .xsmall()
+                    .icon(icon("trash"))
+                    .tooltip("Delete connection")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.confirm_delete_connection(id.clone(), name.clone(), window, cx);
+                    })),
+            )
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.connect(conn.clone(), window, cx)),
+            )
+            .context_menu(move |menu, _, _| {
+                let mut menu = menu.label("Move to group");
+                for f in &folders {
+                    if current.as_deref() == Some(f.as_str()) {
+                        continue;
+                    }
+                    let this = this.clone();
+                    let id = menu_id.clone();
+                    let f2 = f.clone();
+                    menu = menu.item(PopupMenuItem::new(f.clone()).on_click(move |_, _, cx| {
+                        this.update(cx, |app, cx| {
+                            app.move_to_group(id.clone(), Some(f2.clone()), cx)
+                        })
+                    }));
+                }
+                if folders.is_empty() {
+                    menu = menu.label("No groups yet");
+                }
+                if current.is_some() {
+                    let this = this.clone();
+                    let id = menu_id.clone();
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Remove from group").on_click(move |_, _, cx| {
+                                this.update(cx, |app, cx| app.move_to_group(id.clone(), None, cx))
+                            }),
+                        );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// A group header: chevron, folder, name and count. Click folds it; trash deletes it.
+    fn home_group_row(
+        &self,
+        gi: usize,
+        name: &str,
+        count: usize,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let toggle = name.to_string();
+        let del = name.to_string();
+        h_flex()
+            .id(("home-group", gi))
+            .flex_none()
+            .h(px(ROW_H + 4.))
+            .gap_2()
+            .px_2()
+            .rounded(px(6.))
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.sidebar_accent))
+            .child(
+                icon(if open {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                })
+                .size_3p5()
+                .text_color(theme.muted_foreground),
+            )
+            .child(
+                icon(if open { "folder-open" } else { "folder" })
+                    .size_4()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .font_medium()
+                    .child(name.to_string()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(count.to_string()),
+            )
+            .child(
+                Button::new(("home-group-del", gi))
+                    .ghost()
+                    .xsmall()
+                    .icon(icon("trash"))
+                    .tooltip("Delete group")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.confirm_delete_group(del.clone(), count, window, cx);
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.home.collapsed.remove(&toggle) {
+                    this.home.collapsed.insert(toggle.clone());
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     /// The home screen: saved connections on the left, an overview on the right.
     pub(super) fn render_home(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -156,13 +530,41 @@ impl ThaanApp {
         let history = self.engine.history(200);
         let saved_queries = self.engine.saved_queries().len();
 
-        // ---- sidebar: every saved connection ----
-        let shown: Vec<(usize, ConnectionConfig)> = saved
-            .iter()
-            .cloned()
-            .enumerate()
-            .filter(|(_, c)| q.is_empty() || c.name.to_lowercase().contains(&q))
-            .collect();
+        // ---- sidebar: groups with their connections, then connections in no group ----
+        let matches = |c: &ConnectionConfig| q.is_empty() || c.name.to_lowercase().contains(&q);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (gi, g) in self.home.folders.clone().iter().enumerate() {
+            let members: Vec<(usize, &ConnectionConfig)> = saved
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.folder.as_deref() == Some(g.as_str()))
+                .collect();
+            let name_hit = !q.is_empty() && g.to_lowercase().contains(&q);
+            let shown: Vec<_> = members
+                .iter()
+                .filter(|(_, c)| name_hit || matches(c))
+                .collect();
+            if !q.is_empty() && shown.is_empty() && !name_hit {
+                continue;
+            }
+            // A search opens every group so matches are never hidden.
+            let open = !q.is_empty() || !self.home.collapsed.contains(g);
+            rows.push(self.home_group_row(gi, g, members.len(), open, cx));
+            if open {
+                for (i, c) in shown {
+                    rows.push(self.home_conn_row(*i, c, true, cx));
+                }
+            }
+        }
+        for (i, c) in saved.iter().enumerate() {
+            let grouped = c
+                .folder
+                .as_ref()
+                .is_some_and(|f| self.home.folders.contains(f));
+            if !grouped && matches(c) {
+                rows.push(self.home_conn_row(i, c, false, cx));
+            }
+        }
         let sidebar =
             v_flex()
                 .w(px(280.))
@@ -178,6 +580,16 @@ impl ThaanApp {
                         .pb_1()
                         .gap_1()
                         .child(div().flex_1().child(Input::new(&self.home.filter).small()))
+                        .child(
+                            Button::new("home-new-group")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon("folder-plus"))
+                                .tooltip("New group")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_group_dialog(window, cx)
+                                })),
+                        )
                         .child(
                             Button::new("home-new")
                                 .ghost()
@@ -212,51 +624,7 @@ impl ThaanApp {
                                     .child("No saved connections yet"),
                             )
                         })
-                        .children(shown.into_iter().map(|(i, c)| {
-                            let color = c
-                                .color
-                                .as_deref()
-                                .and_then(parse_hex)
-                                .unwrap_or(theme.primary);
-                            let id = c.id.clone();
-                            let name = c.name.clone();
-                            h_flex()
-                                .id(("home-conn", i))
-                                .flex_none()
-                                .h(px(ROW_H + 4.))
-                                .gap_2()
-                                .px_2()
-                                .rounded(px(6.))
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.sidebar_accent))
-                                .child(
-                                    db_icon(&c.driver)
-                                        .size_4()
-                                        .text_color(theme.muted_foreground),
-                                )
-                                .child(div().flex_1().truncate().child(c.name.clone()))
-                                .child(conn_dot(color))
-                                .child(
-                                    Button::new(("home-del", i))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(icon("trash"))
-                                        .tooltip("Delete connection")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.confirm_delete_connection(
-                                                id.clone(),
-                                                name.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.connect(c.clone(), window, cx)
-                                }))
-                        })),
+                        .children(rows),
                 );
 
         // ---- overview ----
@@ -620,6 +988,10 @@ impl ThaanApp {
                         match this
                             .form_config(cx)
                             .map_err(|e| e.to_string())
+                            .map(|mut c| {
+                                c.folder = this.picked_group(cx);
+                                c
+                            })
                             .and_then(|c| this.engine.save_connection(c).map_err(|e| e.to_string()))
                         {
                             Ok(c) => {
@@ -806,6 +1178,14 @@ impl ThaanApp {
                         field(&spec.label, Input::new(st).into_any_element(), &theme)
                     }),
             )
+            .child(field(
+                "Group",
+                div()
+                    .w(px(240.))
+                    .child(Select::new(&self.home.group_pick).small())
+                    .into_any_element(),
+                &theme,
+            ))
             .child(
                 Checkbox::new("ro")
                     .label("Read-only, refuse writes")

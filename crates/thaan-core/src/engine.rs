@@ -206,6 +206,88 @@ impl Engine {
         s.save()
     }
 
+    // ---- connection groups ------------------------------------------------------------
+
+    /// Groups in display order: the stored list, then any group a connection names that the
+    /// list does not have yet (older stores, hand-edited files).
+    pub fn folders(&self) -> Vec<String> {
+        let s = self.store();
+        let mut out = s.data.folders.clone();
+        for c in &s.data.connections {
+            if let Some(f) = &c.folder {
+                if !out.iter().any(|x| x == f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Adds an empty group at the end. Names are trimmed and must be unique (ignoring case).
+    pub fn create_folder(&self, name: &str) -> Result<Vec<String>> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::InvalidParams("group name is required".into()));
+        }
+        if self
+            .folders()
+            .iter()
+            .any(|f| f.to_lowercase() == name.to_lowercase())
+        {
+            return Err(Error::InvalidParams(format!(
+                "a group named “{name}” exists"
+            )));
+        }
+        let mut s = self.store();
+        s.data.folders.push(name.to_string());
+        s.save()?;
+        drop(s);
+        Ok(self.folders())
+    }
+
+    /// Removes a group. Its connections stay, outside any group.
+    pub fn delete_folder(&self, name: &str) -> Result<Vec<String>> {
+        let mut s = self.store();
+        let had = s.data.folders.iter().any(|f| f == name)
+            || s.data
+                .connections
+                .iter()
+                .any(|c| c.folder.as_deref() == Some(name));
+        if !had {
+            return Err(Error::InvalidParams(format!("no group named “{name}”")));
+        }
+        s.data.folders.retain(|f| f != name);
+        for c in &mut s.data.connections {
+            if c.folder.as_deref() == Some(name) {
+                c.folder = None;
+            }
+        }
+        s.save()?;
+        drop(s);
+        Ok(self.folders())
+    }
+
+    /// Puts a connection in a group (created if new), or takes it out with `None`.
+    pub fn move_connection(&self, id: &str, folder: Option<&str>) -> Result<ConnectionConfig> {
+        let folder = folder.map(str::trim).filter(|f| !f.is_empty());
+        let mut s = self.store();
+        if let Some(f) = folder {
+            if !s.data.folders.iter().any(|x| x == f) {
+                s.data.folders.push(f.to_string());
+            }
+        }
+        let c = s
+            .data
+            .connections
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| Error::UnknownConnection(id.into()))?;
+        c.folder = folder.map(String::from);
+        let out = c.clone();
+        s.save()?;
+        Ok(out)
+    }
+
     pub fn test_connection(&self, c: &ConnectionConfig) -> TestResult {
         let t = Instant::now();
         let r = self
@@ -598,6 +680,40 @@ pub fn is_read_statement(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_groups() {
+        let e = Engine::new(Store::in_memory());
+        e.store().data.connections.push(ConnectionConfig {
+            id: "c1".into(),
+            name: "shop".into(),
+            ..Default::default()
+        });
+        assert_eq!(e.create_folder("  Prod ").unwrap(), vec!["Prod"]);
+        assert!(
+            e.create_folder("prod").is_err(),
+            "names are unique ignoring case"
+        );
+        assert!(e.create_folder(" ").is_err());
+        // Moving into a new group creates it; moving out keeps the group.
+        assert_eq!(
+            e.move_connection("c1", Some("Dev"))
+                .unwrap()
+                .folder
+                .as_deref(),
+            Some("Dev")
+        );
+        assert_eq!(e.folders(), vec!["Prod", "Dev"]);
+        assert_eq!(e.move_connection("c1", None).unwrap().folder, None);
+        assert_eq!(e.folders(), vec!["Prod", "Dev"]);
+        // Deleting a group frees its connections, never deletes them.
+        e.move_connection("c1", Some("Prod")).unwrap();
+        assert_eq!(e.delete_folder("Prod").unwrap(), vec!["Dev"]);
+        assert_eq!(e.connections()[0].folder, None);
+        assert_eq!(e.connections().len(), 1);
+        assert!(e.delete_folder("Nope").is_err());
+        assert!(e.move_connection("missing", None).is_err());
+    }
 
     #[test]
     fn read_statement_detection() {

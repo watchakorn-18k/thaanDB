@@ -45,6 +45,10 @@ pub struct HistoryEntry {
 pub struct StoreData {
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
+    /// Connection groups in display order. A group can be empty; a connection belongs to one
+    /// through `ConnectionConfig::folder`.
+    #[serde(default)]
+    pub folders: Vec<String>,
     #[serde(default)]
     pub saved_queries: Vec<SavedQuery>,
     #[serde(default)]

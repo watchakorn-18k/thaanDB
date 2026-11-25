@@ -86,6 +86,38 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             true
         ),
         cmd!(
+            "connection.listFolders",
+            "List connection groups",
+            "Connection",
+            "{}",
+            None,
+            false
+        ),
+        cmd!(
+            "connection.createFolder",
+            "New connection group",
+            "Connection",
+            "{name}",
+            None,
+            true
+        ),
+        cmd!(
+            "connection.deleteFolder",
+            "Delete connection group",
+            "Connection",
+            "{name} (its connections stay, outside any group)",
+            None,
+            true
+        ),
+        cmd!(
+            "connection.moveToFolder",
+            "Move connection to group",
+            "Connection",
+            "{id, folder?} (no folder: out of its group)",
+            None,
+            true
+        ),
+        cmd!(
             "connection.test",
             "Test connection",
             "Connection",
@@ -368,6 +400,18 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
         "connection.delete" => {
             e.delete_connection(&p::<String>(&params["id"])?)?;
             json!({ "ok": true })
+        }
+        "connection.listFolders" => serde_json::to_value(e.folders())?,
+        "connection.createFolder" => {
+            serde_json::to_value(e.create_folder(&p::<String>(&params["name"])?)?)?
+        }
+        "connection.deleteFolder" => {
+            serde_json::to_value(e.delete_folder(&p::<String>(&params["name"])?)?)?
+        }
+        "connection.moveToFolder" => {
+            let id: String = p(&params["id"])?;
+            let folder: Option<String> = p(&params["folder"]).unwrap_or(None);
+            serde_json::to_value(e.move_connection(&id, folder.as_deref())?)?
         }
         "connection.test" => serde_json::to_value(e.test_connection(&p(params)?))?,
         "connection.open" => {

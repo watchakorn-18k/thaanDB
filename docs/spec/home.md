@@ -9,9 +9,20 @@ is taken; layout details, wording, icons and colours are ours (`docs/clean-room.
 
 ## Home
 
-- **Sidebar (280px):** a search box that filters saved connections by name, a *+* button for a
-  new connection, then every saved connection (driver icon, name, colour dot, delete).
-  Clicking a row connects.
+- **Sidebar (280px):** a search box that filters saved connections by name, a *New group*
+  button (`folder-plus`) and a *+* button for a new connection, then the connections:
+  - **Groups first,** in the order they were made. A group row shows a chevron, a folder
+    icon, its name, its connection count in muted mono and a delete button. Clicking the row
+    folds or unfolds it (view state only). Its connections sit under it, indented.
+  - **Then connections in no group.** Each row: database logo, name, colour dot, delete.
+    Clicking a row connects; right-click offers *Move to group* (every other group) and
+    *Remove from group*.
+  - A search shows groups whose name or connections match, unfolded.
+- **New group:** a small dialog with a name box (Enter or *Create*). Names are unique,
+  ignoring case. An empty group stays until it is deleted.
+- **Delete group:** asks first (`Delete group "Production"?`) and says the connections stay;
+  they move out of the group, none is deleted.
+- **New connection form:** a *Group* picker (*No group* first) sets the group on *Save*.
 - **Counts:** four compact cards: saved connections, database types (registered drivers),
   saved queries, queries run (history). Numbers only.
 - **Quick connect:** the first five saved connections with driver name and target (file
