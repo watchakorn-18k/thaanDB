@@ -9,7 +9,9 @@ Guide for coding agents (and humans) working in this repository.
   table data and structure, import and export.
 - The feature set grows toward that of the popular desktop SQL clients, written clean-room
   (see `docs/clean-room.md`). The roadmap is `docs/spec/features.md`.
-- The GUI is built with **GPUI** (`gpui` + `gpui-component`). The engine (`thaan-core`) has no
+- Speed and low memory come first (principle 9): everything opens instantly, nothing
+  freezes, and the app stays light on RAM.
+- The GUI is built with **gpui-kit** (GPUI + its component library). The engine (`thaan-core`) has no
   GUI dependency and stays buildable for `wasm32-unknown-unknown`.
 
 ## Principles
@@ -39,6 +41,68 @@ Guide for coding agents (and humans) working in this repository.
    including Electron `app.asar` bundles and source maps), and never copy their code,
    CSS, icons, strings or trademarks. Specs come from official database protocol docs,
    public user docs and observed behaviour. See `docs/clean-room.md`.
+9. **Fast and light come first.** Speed and low memory outrank features and looks. Opening
+   anything must feel instant, the window must never freeze, and the app must stay light on
+   the machine and on RAM. When something truly has to wait (connecting to a server, a
+   slow query, a big export), the UI says so at once with a loading state. The concrete
+   rules are in [Performance](#performance) below and apply to every change.
+
+## Performance
+
+These rules make principle 9 concrete. A change that breaks one is not done.
+
+### Never block the UI thread
+
+- No database, network or disk work on the UI thread. Every `Engine` call that can touch a
+  driver, a server or a file (connect, query, `list_objects`, `describe_table`, `ddl`,
+  `fetch_page`, export, import, store save) runs in `cx.background_spawn` and updates the
+  view when it returns. Only pure in-memory work stays on the UI thread.
+- `render` does no I/O and no heavy work. It must not call the engine for data it can
+  cache. Cache in the view (history, saved queries, schema) and refresh on change.
+- Long work can be cancelled (query cancel, export cancel), and a stale result never
+  overwrites newer state: drop the answer when the tab or request it belongs to is gone.
+
+### Show a state for anything that waits
+
+- Under about 100 ms: no indicator, just show the result (a flash of a spinner reads as lag).
+- Over about 100 ms: show a state right where the content will appear, said in words:
+  `Connecting to shop-prod…`, `Running query…`, `Loading 100 rows…`, `Exporting…`.
+  Use a skeleton for grids, lists and the schema tree, a spinner or progress text for
+  buttons and the status bar, a progress count for exports and imports.
+- Keep the previous content visible while refreshing instead of blanking it.
+- Motion for these states follows `docs/spec/ui.md`: subtle, one easing curve, no
+  looping decoration on things that are not actually waiting.
+
+### Keep memory small
+
+- Never load a whole table or an unbounded result into memory. Tables are paged
+  (`PageRequest`, 100 rows by default). Query results get a row cap with a clear
+  "first N rows" note and a way to fetch more.
+- Exports and imports stream row by row to and from disk; they never build the whole file
+  as one `String` or `Vec`.
+- Hold one copy of a result. Share it (`Arc`) between the tab and the grid instead of
+  cloning `ResultSet`s. Free a tab's data when the tab closes.
+- Grids and long lists are virtualized (render only visible rows). Long cell values are
+  truncated for display; the full value loads only when asked for.
+- Schema metadata loads lazily (expand a node, then fetch its children) and is cached per
+  session.
+- History and other stores are capped and saved off the UI thread.
+
+### Start fast, build lean
+
+- Startup opens the window first, then loads anything else. No network at startup.
+- Drivers and heavy features stay behind Cargo features; add a dependency only when it
+  pays for itself, and prefer the lighter crate.
+- Release builds use the tuned `[profile.release]` in the workspace `Cargo.toml`.
+
+### Measure
+
+- Use release builds for any speed or memory claim (`cargo build --release -p thaan-app`).
+- Check idle RAM and RAM after opening a large table (Activity Monitor or
+  `ps -o rss= -p <pid>` on macOS/Linux), and note the numbers in the PR when a change can
+  affect them.
+- Add a test or benchmark for engine hot paths (statement splitting, paging SQL, export
+  writers) when changing them.
 
 ## Layout
 

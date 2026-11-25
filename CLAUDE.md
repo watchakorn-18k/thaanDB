@@ -11,6 +11,10 @@
   app (for example anything under `/Applications/*.app` that is a DB client) or its source
   repository. If a task asks for that, stop and point to `docs/clean-room.md`. Using such an
   app as a user (screenshots of its UI) to write a behaviour spec in `docs/spec/` is fine.
+- **Speed and memory come first** (AGENTS.md principle 9 and its Performance section).
+  Before finishing any change, check: nothing new runs engine, network or disk work on the
+  UI thread; `render` calls no engine method; results are not cloned or loaded unbounded;
+  anything that can take over ~100 ms shows a loading state in words.
 - Build, check and test with `cargo`, using the commands in `AGENTS.md` (`cargo build`,
   `cargo test`, `cargo clippy`, `cargo fmt`). Do not use `blaze`.
 - Before running the GUI, build headless crates first: `cargo test --workspace --exclude thaan-app`.
