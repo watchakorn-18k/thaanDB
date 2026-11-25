@@ -166,9 +166,14 @@ Notes from using them:
 
 ### Icons
 
-- **Set:** lucide only (version 1.43, ISC licence in `gpui-kit-assets-0.11.0/LICENSE-LUCIDE`),
+- **Database logos:** each driver shows its own database's logo from Simple Icons (CC0),
+  embedded by `crates/thaan-app/src/assets.rs` and drawn with `db_icon(driver_id)` in one
+  colour like any other icon. Sources and the trademark note are in
+  `crates/thaan-app/assets/db-icons/SOURCES.md`; add new logos the same way. Drivers
+  without a logo fall back to lucide `database`. Never take logos from another database client.
+- **Set (everything else):** lucide only (version 1.43, ISC licence in `gpui-kit-assets-0.11.0/LICENSE-LUCIDE`),
   shipped by `gpui-kit-assets`. Do not add other icon sets, emoji or other products' logos.
-  The ThaanDB logo is the one exception (`logo.rs`, from `docs/brand`).
+  The exceptions are the ThaanDB logo (`logo.rs`, from `docs/brand`) and the database logos above.
 - **How:** `icon("name")` in `app.rs` → `Icon::empty().path("icons/name.svg")`. The name is the
   lucide file name without `.svg`. Check that it exists:
   `ls ~/.cargo/registry/src/*/gpui-kit-assets-0.11.0/assets/icons/<name>.svg`.
@@ -179,7 +184,6 @@ Notes from using them:
 | Meaning | Icon |
 | --- | --- |
 | Database / connection, objects rail, SQL drivers | `database` |
-| SQLite (a file) / MongoDB (documents) | `file` / `braces` |
 | Table, view, index, trigger, other object | `table`, `eye`, `list`, `zap`, `code` |
 | Query tab, saved query | `file-code` |
 | Saved queries rail, save query | `bookmark` |

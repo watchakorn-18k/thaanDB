@@ -46,14 +46,6 @@ fn family(driver_id: &str) -> &'static str {
     }
 }
 
-fn driver_icon(driver_id: &str) -> &'static str {
-    match driver_id {
-        "mongodb" => "braces",
-        "sqlite" => "file",
-        _ => "database",
-    }
-}
-
 fn driver_note(driver_id: &str) -> &'static str {
     match driver_id {
         "sqlite" => "A single file on this computer",
@@ -187,7 +179,7 @@ impl ThaanApp {
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.sidebar_accent))
                                 .child(
-                                    icon(driver_icon(&c.driver))
+                                    db_icon(&c.driver)
                                         .size_4()
                                         .text_color(theme.muted_foreground),
                                 )
@@ -308,7 +300,7 @@ impl ThaanApp {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.list_hover))
                         .child(
-                            icon(driver_icon(&c.driver))
+                            db_icon(&c.driver)
                                 .size_4()
                                 .text_color(theme.muted_foreground),
                         )
@@ -547,7 +539,7 @@ impl ThaanApp {
                     .gap_2()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(icon(driver_icon(&self.driver.id)).size_4())
+                    .child(db_icon(&self.driver.id).size_4())
                     .child(format!("Selected: {}", self.driver.name)),
             )
             .when(step == ConnDialog::Pick, |d| {
@@ -655,11 +647,7 @@ impl ThaanApp {
                         .justify_center()
                         .rounded(px(8.))
                         .bg(theme.muted.opacity(0.6))
-                        .child(
-                            icon(driver_icon(&d.id))
-                                .size_5()
-                                .text_color(theme.foreground),
-                        ),
+                        .child(db_icon(&d.id).size_5().text_color(theme.foreground)),
                 )
                 .child(div().text_sm().font_medium().child(d.name.clone()))
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {

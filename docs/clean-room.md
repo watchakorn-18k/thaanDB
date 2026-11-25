@@ -12,6 +12,7 @@ feature set and a layout that users of existing SQL clients find familiar. It is
 | Public marketing pages, user docs, changelogs | Feature lists and user-visible behaviour only |
 | Official protocol and dialect docs (PostgreSQL, MySQL/MariaDB, SQLite, SQL Server TDS, Oracle, ClickHouse, ...) | Implementing drivers and SQL generation |
 | Open-source crates under permissive licences (MIT / Apache-2.0 / BSD / Zlib / MPL-2.0 as a dependency) | Normal dependencies, recorded in `Cargo.toml` |
+| Icon sets under CC0 / MIT / ISC that are not a database client (lucide via gpui-kit, Simple Icons for database logos) | Shipped unchanged with source, version and licence recorded next to the files (`crates/thaan-app/assets/db-icons/SOURCES.md`). Database logos are trademarks: used only to name the database a connection is for |
 | General UI conventions (sidebar + tabs + editor + result grid) | Freely |
 
 ## What we must never do

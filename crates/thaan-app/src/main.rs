@@ -1,6 +1,7 @@
 //! Desktop app (GPUI). One client of `thaan-core`; see AGENTS.md.
 
 mod app;
+mod assets;
 mod docview;
 mod grid;
 mod logo;
@@ -27,7 +28,7 @@ fn main() {
     engine.register_driver(Arc::new(thaan_driver_mongodb::MongoDriver));
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             theme::apply(ThemeMode::Dark, None, cx);

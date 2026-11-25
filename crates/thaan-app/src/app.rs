@@ -6,7 +6,6 @@ mod doc_editor;
 #[path = "home.rs"]
 mod home;
 
-
 use crate::docview::{view_switch, DocPanel, DocView};
 use crate::grid::ResultGrid;
 use crate::theme;
@@ -77,6 +76,15 @@ pub fn bind_keys(cx: &mut App) {
 
 fn icon(name: &str) -> Icon {
     Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
+}
+
+/// A database's own logo (Simple Icons, CC0; see `assets.rs`) in one colour, or a lucide
+/// fallback for drivers we have no logo for.
+fn db_icon(driver_id: &str) -> Icon {
+    match crate::assets::db_logo_path(driver_id) {
+        Some(path) => Icon::empty().path(path),
+        None => icon("database"),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2416,6 +2424,11 @@ impl Render for ThaanApp {
                     .gap_2()
                     .items_center()
                     .child(conn_dot(color))
+                    .child(
+                        db_icon(&s.driver)
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    )
                     .child(div().font_medium().child(s.name.clone()))
                     .child(
                         div()
