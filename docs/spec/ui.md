@@ -57,3 +57,11 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
 - Connection forms are generated from `DriverInfo::params` (a parameter schema).
 - Menus, the command palette and shortcuts read `CommandRegistry`; the GUI never hardcodes
   an action that is not a registered command.
+
+## Title bar
+
+- No native title bar. The window uses gpui-kit's `TitleBar` (34 px): on macOS the traffic
+  lights sit at its left, then the current context (the ThaanDB mark and name on the home
+  screen, or the open connection's dot, database logo, name and driver), a hairline
+  divider, a *New connection* button, and *Commands* with its `Kbd` on the right.
+- The empty parts of the bar drag the window; a double click zooms it like a native bar.

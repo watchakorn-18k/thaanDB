@@ -18,10 +18,10 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::table::{ColumnSort, DataTable, TableEvent, TableState};
 use gpui_kit::component::IndexPath;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{
     h_flex, h_resizable, resizable_panel, v_flex, v_resizable, ActiveTheme as _, Icon, Sizable as _,
 };
+use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::BTreeMap;
@@ -2412,7 +2412,7 @@ impl Render for ThaanApp {
                 cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
             );
 
-        // Title bar (we keep the native one and draw a slim header below it).
+        // What the title bar names: the open connection, or the product on the home screen.
         let title = match &self.session {
             Some(s) => {
                 let color = s
@@ -2451,31 +2451,46 @@ impl Render for ThaanApp {
                 .child(crate::logo::mark(theme.primary, theme.foreground))
                 .child(div().font_medium().child("ThaanDB")),
         };
-        let header = h_flex()
-            .h(px(36.))
-            .px_3()
-            .gap_3()
-            .text_sm()
-            .bg(theme.title_bar)
-            .border_b_1()
-            .border_color(theme.title_bar_border)
-            .child(title)
-            .child(div().flex_1())
-            .child(
-                h_flex()
-                    .id("palette")
-                    .h(px(24.))
-                    .px_2()
-                    .gap_1()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .hover(|s| s.bg(theme.list_hover))
-                    .child(div().pr_1().child("Commands"))
-                    .children(kbd(PALETTE_KEY))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
-            );
+        // One row: macOS traffic lights (the kit's TitleBar leaves room for them), then
+        // the current context (logo or connection), New connection and the command palette.
+        let header = TitleBar::new().child(
+            h_flex()
+                .flex_1()
+                .h_full()
+                .pr_3()
+                .gap_3()
+                .text_sm()
+                .child(title)
+                .child(div().w(px(1.)).h(px(16.)).bg(theme.border))
+                .child(
+                    Button::new("title-new-conn")
+                        .ghost()
+                        .small()
+                        .icon(icon("database-plus"))
+                        .label("New connection")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_conn_dialog(window, cx)),
+                        ),
+                )
+                .child(div().flex_1())
+                .child(
+                    h_flex()
+                        .id("palette")
+                        .h(px(24.))
+                        .px_2()
+                        .gap_1()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .hover(|s| s.bg(theme.list_hover))
+                        .child(div().pr_1().child("Commands"))
+                        .children(kbd(PALETTE_KEY))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)),
+                        ),
+                ),
+        );
 
         let status = self.render_status(window, cx);
 

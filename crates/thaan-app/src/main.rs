@@ -34,14 +34,15 @@ fn main() {
             theme::apply(ThemeMode::Dark, None, cx);
             app::bind_keys(cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            // No native title bar: the traffic lights sit inside our own header row
+            // (`TitleBar` in app.rs), which also drags the window.
+            let mut titlebar = gpui_kit::component::TitleBar::title_bar_options();
+            titlebar.title = Some("ThaanDB".into()); // Mission Control and the Window menu
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("ThaanDB".into()),
-                    ..Default::default()
-                }),
+                titlebar: Some(titlebar),
                 window_min_size: Some(size(px(800.), px(500.))),
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             let engine = engine.clone();
             gpui_kit::open_window(options, cx, move |window, cx| {

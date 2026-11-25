@@ -132,6 +132,9 @@ equivalent, switch to the kit one.
 - `gpui_kit::application().with_assets(gpui_kit::assets::AllAssets)`: registers the full
   icon catalog (about 1,830 SVGs, roughly +1 MiB in the binary) so any lucide name works.
 - `gpui_kit::init(cx)` once, before anything else.
+- Window options start from `TitleBar::window_options()` with `TitleBar::title_bar_options()`
+  (transparent title bar, traffic lights inside our header). The header row is a
+  `TitleBar` in `app.rs`; put title-bar items there, never a second bar below it.
 - `gpui_kit::open_window(options, cx, |window, cx| cx.new(...))`: wraps our view in the
   kit's `Root`. The dialog layer (`window.open_dialog`) only works under that `Root`, so
   never open windows with plain `cx.open_window`.
