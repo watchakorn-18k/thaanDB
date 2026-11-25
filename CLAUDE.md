@@ -11,10 +11,8 @@
   app (for example anything under `/Applications/*.app` that is a DB client) or its source
   repository. If a task asks for that, stop and point to `docs/clean-room.md`. Using such an
   app as a user (screenshots of its UI) to write a behaviour spec in `docs/spec/` is fine.
-- **Speed and memory come first** (AGENTS.md principle 9 and its Performance section).
-  Before finishing any change, check: nothing new runs engine, network or disk work on the
-  UI thread; `render` calls no engine method; results are not cloned or loaded unbounded;
-  anything that can take over ~100 ms shows a loading state in words.
+- **Speed and memory come first.** This is the working principle of the whole repo; see
+  [Speed and memory](#speed-and-memory) below. It outranks features and looks.
 - Build, check and test with `cargo`, using the commands in `AGENTS.md` (`cargo build`,
   `cargo test`, `cargo clippy`, `cargo fmt`). Do not use `blaze`.
 - Before running the GUI, build headless crates first: `cargo test --workspace --exclude thaan-app`.
@@ -40,6 +38,81 @@
 - Use `THAAN_HOME=target/thaan-home` for manual testing so the user's real store is untouched.
 - `pkill -f thaan-app` also matches the shell running the command (its text contains the
   name) and kills it. Use `pkill -x thaan-app`.
+
+## Speed and memory
+
+**The rule of this repo: fast first, light on the machine, as little RAM as possible.**
+Everything must open the moment it is asked for and never freeze. Squeeze out all the
+performance you can. When waiting cannot be avoided, the user must see that something is
+happening. This rule outranks features and looks. Apply it to every change, and treat
+breaking it as a bug. (AGENTS.md principle 9 and its Performance section hold the same
+rules for all contributors.)
+
+### Instant, never frozen
+
+- Nothing slow runs on the UI thread: no database, network or disk work. Connect, query,
+  `list_objects`, `describe_table`, `ddl`, `fetch_page`, export, import and saving the store
+  all go through `cx.background_spawn`, and the view updates when they return.
+- `render` does no I/O and calls no `Engine` method. Keep the data the view needs (history,
+  saved queries, schema) in the view and refresh it when it changes.
+- Show what is already known straight away, then fill in the rest. Opening a table shows
+  the tab and its header at once and loads rows behind it.
+- Long work can be cancelled, and a late answer never overwrites newer state (drop it if
+  its tab or request is gone).
+
+### When waiting is unavoidable, say so
+
+- Under ~100 ms: show the result directly, with no indicator (a spinner that flashes reads
+  as lag).
+- Over ~100 ms: show a loading state at once, right where the content will appear, and say
+  in words what it is waiting for:
+  - Connecting: `Connecting to shop-prod…` on the button and in the status bar.
+  - Running a query: `Running…` on Run, plus elapsed time in the status bar.
+  - Loading rows: a skeleton of grid rows (`Loading 100 rows…`), keeping the previous
+    page visible while the next one loads.
+  - Schema: skeleton rows in the tree while objects load.
+  - Export / import: a progress count (`Exporting… 12,400 rows`) with Cancel.
+- Use gpui-kit's own pieces where they exist (spinner, skeleton, progress), styled per
+  `docs/spec/ui.md`: subtle, one easing curve, no looping motion on things that are not
+  waiting.
+
+### Use as little RAM as possible
+
+- Never load a whole table or an unbounded result. Tables are paged (100 rows by default).
+  Query results are capped, with a clear "first N rows" note and a way to load more.
+- Stream exports and imports to and from disk row by row. Never build the whole file as
+  one `String` or `Vec`.
+- Keep one copy of each result. Share it (`Arc`) between the tab and the grid instead of
+  cloning a `ResultSet`. Free a tab's data when the tab closes.
+- Grids and long lists are virtualized. Long cell values are shortened for display, and
+  the full value loads only when asked for.
+- Load schema lazily (on expand) and cache it per session. Cap history and other stores.
+- Startup opens the window first and loads the rest after. No network at startup.
+- Add dependencies only when they pay for themselves; prefer the lighter crate. Heavy
+  parts stay behind Cargo features. Release builds use the tuned `[profile.release]`.
+
+### Check before you finish
+
+- [ ] No new engine, network or disk call on the UI thread, and none in `render`
+- [ ] Nothing loads unbounded data or clones a whole result
+- [ ] Every wait over ~100 ms has a loading state in words (spinner, skeleton or progress)
+- [ ] For speed or memory claims, measure a release build
+  (`cargo build --release -p thaan-app`; RAM via Activity Monitor or `ps -o rss= -p <pid>`)
+  and put the numbers in the PR
+
+### Known gaps in the app today (fix these first)
+
+1. Opening a table calls `describe_table`, and Structure calls `ddl`, on the UI thread.
+   On PostgreSQL or MySQL the window freezes while the server answers.
+2. Export to file reads the whole table and writes it on the UI thread
+   (`export_table_to_file` in `app.rs`; `Engine::export_table` returns one `String`).
+3. The home screen and the History / Saved queries panels call `engine.history(200)` and
+   `engine.saved_queries()` on every render.
+4. Query results have no row cap; `select *` on a big table loads all of it.
+5. Each result is held twice: in the tab (`QueryTab.results`, `TableTab.page`) and in the
+   grid (`ResultGrid.rs`).
+6. No loading state while a table page loads (the grid is empty), while the schema
+   refreshes, or while exporting.
 
 ## GUI toolkit: gpui-kit
 
