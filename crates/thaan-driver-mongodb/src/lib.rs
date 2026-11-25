@@ -7,7 +7,10 @@
 
 pub mod shell;
 
-use mongodb::bson::{self, doc, oid::ObjectId, Binary, Bson, Document};
+/// Re-exported so clients can build and read documents with the same BSON types.
+pub use mongodb::bson;
+
+use mongodb::bson::{doc, oid::ObjectId, Binary, Bson, Document};
 use mongodb::sync::{Client, Database};
 use mongodb::IndexModel;
 use shell::{doc_to_shell, to_shell, Op, UpdateSpec};

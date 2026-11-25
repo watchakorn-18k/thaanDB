@@ -1,31 +1,31 @@
-//! Add / view / edit / delete documents in a MongoDB collection view
+//! Insert / view / edit / delete documents in a MongoDB collection view
 //! (docs/spec/mongodb-ui.md M9). A child module of `app`, so it can read the app's view
 //! state.
 //!
-//! Every action is an ordinary shell command run through the engine
-//! (`insertOne`, `replaceOne`, `deleteOne`, `findOne`), so history, read-only checks and
-//! errors behave exactly as in a query tab.
+//! The toolbar is four icon buttons; each opens a dialog. Every write is an ordinary
+//! shell command run through the engine (`insertOne`, `replaceOne`, `deleteMany`), so
+//! history, read-only checks and errors behave exactly as in a query tab.
 
 use super::*;
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::WindowExt as _;
 use thaan_core::doc::Doc;
+use thaan_core::engine::SessionId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum DocEditMode {
+pub(super) enum DocDialogKind {
+    Insert,
     View,
     Edit,
-    Add,
+    Delete,
 }
 
-/// The side panel of a collection tab.
-pub(super) struct DocEdit {
-    mode: DocEditMode,
-    /// `_id` of the document being viewed or edited.
-    id: Option<Doc>,
-    editor: Entity<EditorState>,
-    error: Option<String>,
-    busy: bool,
-    /// `false` when the document holds values the text form cannot round-trip.
-    editable: bool,
+/// What a delete applies to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeleteScope {
+    Selected,
+    Filter,
+    All,
 }
 
 /// Values whose shell text cannot be parsed back without loss.
@@ -45,6 +45,497 @@ fn collection_expr(name: &str) -> String {
         "db.getCollection({})",
         Doc::String(name.to_string()).to_pretty()
     )
+}
+
+const INSERT_TEMPLATE: &str = "{\n  \n}";
+
+/// Parses the editor text as a document, for Validate and Format.
+#[cfg(feature = "mongodb")]
+fn parse_doc(text: &str) -> Result<Doc, String> {
+    thaan_driver_mongodb::shell::parse_document(text)
+        .map(|d| thaan_driver_mongodb::to_doc(&thaan_driver_mongodb::bson::Bson::Document(d)))
+}
+
+#[cfg(not(feature = "mongodb"))]
+fn parse_doc(_: &str) -> Result<Doc, String> {
+    Err("Built without the MongoDB driver".into())
+}
+
+/// The dialog's state. Lives in its own entity because the dialog builder may run
+/// again while the dialog is open.
+pub(super) struct DocDialog {
+    kind: DocDialogKind,
+    engine: Arc<Engine>,
+    session_id: SessionId,
+    app: WeakEntity<ThaanApp>,
+    tab_ix: usize,
+    collection: String,
+    /// `connection / collection`, shown above the editor.
+    place: String,
+    id: Option<Doc>,
+    /// The collection view's filter text, for the "Current filter" delete scope.
+    view_filter: String,
+    editor: Entity<EditorState>,
+    /// Validation result, error or note, and whether it is an error.
+    note: Option<(String, bool)>,
+    busy: bool,
+    wrap: bool,
+    editable: bool,
+    read_only: bool,
+    scope: DeleteScope,
+    matches: Option<u64>,
+    inserted: u64,
+}
+
+impl DocDialog {
+    pub(super) fn title(&self) -> &'static str {
+        match self.kind {
+            DocDialogKind::Insert => "Insert document",
+            DocDialogKind::View => "Document",
+            DocDialogKind::Edit => "Edit document",
+            DocDialogKind::Delete => "Delete documents",
+        }
+    }
+
+    fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).value().trim().to_string()
+    }
+
+    fn set_text(&self, text: impl Into<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.editor
+            .update(cx, |e, cx| e.set_value(text, window, cx));
+    }
+
+    fn validate(&mut self, cx: &mut Context<Self>) -> bool {
+        let res = parse_doc(&self.text(cx));
+        self.note = Some(match &res {
+            Ok(Doc::Object(f)) => (
+                format!("Valid · {}", plural(f.len() as u64, "field")),
+                false,
+            ),
+            Ok(_) => ("Valid".into(), false),
+            Err(e) => (e.clone(), true),
+        });
+        cx.notify();
+        res.is_ok()
+    }
+
+    fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match parse_doc(&self.text(cx)) {
+            Ok(d) => {
+                self.set_text(d.to_pretty(), window, cx);
+                self.note = None;
+            }
+            Err(e) => self.note = Some((e, true)),
+        }
+        cx.notify();
+    }
+
+    fn set_wrap(&mut self, wrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.wrap = wrap;
+        self.editor
+            .update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
+        cx.notify();
+    }
+
+    fn request(&self, sql: String) -> QueryRequest {
+        QueryRequest {
+            session_id: self.session_id,
+            sql,
+            scope: RunScope::All,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// Loads the whole document for View / Edit (the grid may show a projection, and
+    /// saving a partial document with replaceOne would drop the hidden fields).
+    fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = &self.id else { return };
+        self.busy = true;
+        let req = self.request(format!(
+            "{}.findOne({{ _id: {} }})",
+            collection_expr(&self.collection),
+            id.to_pretty()
+        ));
+        let engine = self.engine.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.run_query(&req) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                let doc = res
+                    .ok()
+                    .and_then(|r| r.into_iter().next()?.result?.documents?.into_iter().next());
+                match doc {
+                    Some(doc) => {
+                        this.editable = round_trips(&doc);
+                        this.set_text(doc.to_pretty(), window, cx);
+                    }
+                    None => this.note = Some(("The document no longer exists".into(), true)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn delete_query(&self) -> String {
+        match (self.scope, &self.id) {
+            (DeleteScope::Selected, Some(id)) => format!("{{ _id: {} }}", id.to_pretty()),
+            (DeleteScope::Filter, _) if !self.view_filter.trim().is_empty() => {
+                self.view_filter.clone()
+            }
+            _ => "{}".into(),
+        }
+    }
+
+    fn set_scope(&mut self, scope: DeleteScope, window: &mut Window, cx: &mut Context<Self>) {
+        self.scope = scope;
+        self.set_text(self.delete_query(), window, cx);
+        self.count(window, cx);
+    }
+
+    /// Counts what the delete query matches, so the button can say how many go.
+    fn count(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.matches = None;
+        self.note = None;
+        let req = self.request(format!(
+            "{}.countDocuments({})",
+            collection_expr(&self.collection),
+            self.text(cx)
+        ));
+        let engine = self.engine.clone();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.run_query(&req) })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Err(e) => this.note = Some((e.to_string(), true)),
+                    Ok(r) => match r.into_iter().next() {
+                        Some(StatementResult { error: Some(e), .. }) => this.note = Some((e, true)),
+                        Some(StatementResult {
+                            result: Some(rs), ..
+                        }) => {
+                            this.matches = match rs.rows.first().and_then(|r| r.first()) {
+                                Some(thaan_core::Value::Int(n)) => Some((*n).max(0) as u64),
+                                _ => None,
+                            };
+                        }
+                        _ => {}
+                    },
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Insert, update or delete. `again` keeps an insert dialog open for the next one.
+    fn submit(&mut self, again: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let coll = collection_expr(&self.collection);
+        let text = self.text(cx);
+        let sql = match (self.kind, &self.id) {
+            (DocDialogKind::Insert, _) => format!("{coll}.insertOne({text})"),
+            (DocDialogKind::Edit, Some(id)) => {
+                format!("{coll}.replaceOne({{ _id: {} }}, {text})", id.to_pretty())
+            }
+            (DocDialogKind::Delete, _) => format!("{coll}.deleteMany({text})"),
+            _ => return,
+        };
+        self.busy = true;
+        self.note = None;
+        cx.notify();
+        let req = self.request(sql);
+        let engine = self.engine.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { engine.run_query(&req) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                let first = match res {
+                    Err(e) => {
+                        this.note = Some((e.to_string(), true));
+                        return cx.notify();
+                    }
+                    Ok(r) => r.into_iter().next(),
+                };
+                if let Some(e) = first.as_ref().and_then(|s| s.error.clone()) {
+                    this.note = Some((e, true));
+                    return cx.notify();
+                }
+                let affected = first
+                    .and_then(|s| s.result)
+                    .and_then(|r| r.rows_affected)
+                    .unwrap_or(0);
+                let msg = match this.kind {
+                    DocDialogKind::Insert => "Document inserted".to_string(),
+                    DocDialogKind::Edit => "Document updated".to_string(),
+                    _ => format!("Deleted {}", plural(affected, "document")),
+                };
+                let tab_ix = this.tab_ix;
+                this.app
+                    .update(cx, |app, cx| {
+                        app.set_status(msg, false, cx);
+                        if app.active == tab_ix {
+                            app.load_page(cx);
+                        }
+                    })
+                    .ok();
+                if again {
+                    this.inserted += 1;
+                    this.set_text(INSERT_TEMPLATE, window, cx);
+                    this.note = Some((
+                        format!(
+                            "{} inserted · ready for the next",
+                            plural(this.inserted, "document")
+                        ),
+                        false,
+                    ));
+                    cx.notify();
+                } else {
+                    window.close_dialog(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+impl Render for DocDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let mono = theme.mono_font_family.clone();
+        let kind = self.kind;
+        let writing = matches!(kind, DocDialogKind::Insert | DocDialogKind::Edit) && self.editable;
+        let readonly_editor = (!writing && kind != DocDialogKind::Delete) || self.busy;
+
+        // Where the document lives, then (for delete) what the delete applies to.
+        let place = h_flex()
+            .gap_3()
+            .text_xs()
+            .font_family(mono.clone())
+            .text_color(theme.muted_foreground)
+            .child(self.place.clone())
+            .children(
+                self.id
+                    .as_ref()
+                    .filter(|_| kind != DocDialogKind::Delete)
+                    .map(|id| div().child(format!("_id {}", id.summary()))),
+            );
+        let scopes = (kind == DocDialogKind::Delete).then(|| {
+            let current = self.scope;
+            let has_id = self.id.is_some();
+            let scope_btn =
+                |id: &'static str, label: &'static str, s: DeleteScope, enabled: bool| {
+                    Button::new(id)
+                        .xsmall()
+                        .ghost()
+                        .label(label)
+                        .selected(current == s)
+                        .disabled(!enabled)
+                };
+            h_flex()
+                .gap_1()
+                .child(
+                    scope_btn(
+                        "scope-selected",
+                        "Selected document",
+                        DeleteScope::Selected,
+                        has_id,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_scope(DeleteScope::Selected, window, cx)
+                    })),
+                )
+                .child(
+                    scope_btn("scope-filter", "Current filter", DeleteScope::Filter, true)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_scope(DeleteScope::Filter, window, cx)
+                        })),
+                )
+                .child(
+                    scope_btn("scope-all", "All documents", DeleteScope::All, true).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.set_scope(DeleteScope::All, window, cx)
+                        }),
+                    ),
+                )
+        });
+
+        let editor = div()
+            .h(px(360.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(
+                Editor::new(&self.editor)
+                    .readonly(readonly_editor)
+                    .bordered(false)
+                    .h_full(),
+            );
+
+        let note = self.note.clone().map(|(text, err)| {
+            div()
+                .text_xs()
+                .font_family(mono.clone())
+                .text_color(if err {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                })
+                .child(text)
+        });
+        let warn = (!self.editable).then(|| {
+            div().text_xs().text_color(theme.warning).child(
+                "Holds binary or special values the text form cannot save back, so it opens read-only",
+            )
+        });
+        let delete_note = (kind == DocDialogKind::Delete).then(|| {
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Deleted documents cannot be restored")
+        });
+
+        // Footer: tools on the left, the decision on the right.
+        let tools = h_flex()
+            .gap_1()
+            .when(writing || kind == DocDialogKind::Delete, |d| {
+                d.child(
+                    Button::new("doc-validate")
+                        .small()
+                        .ghost()
+                        .icon(icon("check"))
+                        .label("Validate")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.validate(cx) && this.kind == DocDialogKind::Delete {
+                                this.count(window, cx);
+                            }
+                        })),
+                )
+            })
+            .when(writing, |d| {
+                d.child(
+                    Button::new("doc-format")
+                        .small()
+                        .ghost()
+                        .icon(icon("braces"))
+                        .label("Format")
+                        .on_click(cx.listener(|this, _, window, cx| this.format(window, cx))),
+                )
+            })
+            .child(
+                div().pl_2().child(
+                    Checkbox::new("doc-wrap")
+                        .label("Wrap lines")
+                        .checked(self.wrap)
+                        .on_click(
+                            cx.listener(|this, v: &bool, window, cx| this.set_wrap(*v, window, cx)),
+                        ),
+                ),
+            );
+
+        let esc = Keystroke::parse("escape")
+            .ok()
+            .map(|k| Kbd::new(k).outline());
+        let decide = h_flex()
+            .gap_2()
+            .items_center()
+            .children(esc)
+            .child(
+                Button::new("doc-cancel")
+                    .small()
+                    .ghost()
+                    .label(if kind == DocDialogKind::View {
+                        "Close"
+                    } else {
+                        "Cancel"
+                    })
+                    .on_click(cx.listener(|_, _, window, cx| window.close_dialog(cx))),
+            )
+            .when(
+                kind == DocDialogKind::View && self.editable && !self.read_only,
+                |d| {
+                    d.child(
+                        Button::new("doc-to-edit")
+                            .small()
+                            .icon(icon("pencil"))
+                            .label("Edit")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.kind = DocDialogKind::Edit;
+                                this.note = None;
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .when(kind == DocDialogKind::Insert, |d| {
+                d.child(
+                    Button::new("doc-insert-again")
+                        .small()
+                        .label("Insert and add another")
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(true, window, cx))),
+                )
+            })
+            .when(writing, |d| {
+                d.child(
+                    Button::new("doc-save")
+                        .small()
+                        .primary()
+                        .label(match (kind, self.busy) {
+                            (_, true) => "Saving…",
+                            (DocDialogKind::Insert, _) => "Insert",
+                            _ => "Update",
+                        })
+                        .disabled(self.busy)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit(false, window, cx)),
+                        ),
+                )
+            })
+            .when(kind == DocDialogKind::Delete, |d| {
+                let label = match (self.busy, self.matches) {
+                    (true, _) => "Deleting…".to_string(),
+                    (_, Some(n)) => format!("Delete {}", plural(n, "document")),
+                    (_, None) => "Delete".into(),
+                };
+                d.child(
+                    Button::new("doc-delete")
+                        .small()
+                        .danger()
+                        .label(label)
+                        .disabled(
+                            self.busy || self.read_only || self.matches.is_none_or(|n| n == 0),
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit(false, window, cx)),
+                        ),
+                )
+            });
+
+        v_flex()
+            .gap_3()
+            .child(place)
+            .children(scopes)
+            .child(editor)
+            .children(warn)
+            .children(note)
+            .children(delete_note)
+            .child(h_flex().pt_1().justify_between().child(tools).child(decide))
+    }
 }
 
 impl ThaanApp {
@@ -68,212 +559,69 @@ impl ThaanApp {
         docs.get(ix).cloned()
     }
 
-    pub(super) fn open_doc_editor(
+    pub(super) fn open_doc_dialog(
         &mut self,
-        mode: DocEditMode,
+        kind: DocDialogKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = if mode == DocEditMode::Add {
-            None
-        } else {
-            match self.selected_doc(cx).and_then(|d| d.get("_id").cloned()) {
-                Some(id) => Some(id),
-                None => {
-                    return self.set_status(
-                        "Select a document with an _id first (click a row)",
-                        true,
-                        cx,
-                    )
-                }
-            }
+        let Some(session) = self.session.clone() else {
+            return;
         };
+        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
+            return;
+        };
+        let id = self.selected_doc(cx).and_then(|d| d.get("_id").cloned());
+        if matches!(kind, DocDialogKind::View | DocDialogKind::Edit) && id.is_none() {
+            return self.set_status("Select a document first", true, cx);
+        }
+        let collection = t.object.name.clone();
+        let view_filter = t.filter.read(cx).value().trim().to_string();
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("javascript")
                 .line_number(true)
         });
-        if mode == DocEditMode::Add {
-            editor.update(cx, |e, cx| e.set_value("{\n  \n}", window, cx));
-        }
-        let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        t.pending_delete = false;
-        t.doc_edit = Some(DocEdit {
-            mode,
-            id: id.clone(),
-            editor: editor.clone(),
-            error: None,
-            busy: id.is_some(),
+        let app = cx.entity().downgrade();
+        let dialog = cx.new(|_| DocDialog {
+            kind,
+            engine: self.engine.clone(),
+            session_id: session.session_id,
+            app,
+            tab_ix: self.active,
+            place: format!("{} / {}", session.name, collection),
+            collection,
+            scope: if id.is_some() {
+                DeleteScope::Selected
+            } else {
+                DeleteScope::Filter
+            },
+            id,
+            view_filter,
+            editor,
+            note: None,
+            busy: false,
+            wrap: false,
             editable: true,
+            read_only: session.read_only,
+            matches: None,
+            inserted: 0,
         });
-        cx.notify();
-        let Some(id) = id else {
-            editor.update(cx, |e, cx| e.focus(window, cx));
-            return;
-        };
-
-        // Load the whole document: the grid may show a projection, and saving a partial
-        // document with replaceOne would drop the hidden fields.
-        let Some(session) = &self.session else { return };
-        let req = QueryRequest {
-            session_id: session.session_id,
-            sql: format!(
-                "{}.findOne({{ _id: {} }})",
-                collection_expr(&t.object.name),
-                id.to_pretty()
-            ),
-            scope: RunScope::All,
-            params: BTreeMap::new(),
-        };
-        let engine = self.engine.clone();
-        let ix = self.active;
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_spawn(async move { engine.run_query(&req) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                let Some(Tab::Table(t)) = this.tabs.get_mut(ix) else {
-                    return;
-                };
-                let Some(edit) = t.doc_edit.as_mut() else {
-                    return;
-                };
-                edit.busy = false;
-                let doc = res
-                    .ok()
-                    .and_then(|r| r.into_iter().next()?.result?.documents?.into_iter().next());
-                match doc {
-                    Some(doc) => {
-                        edit.editable = round_trips(&doc);
-                        let text = doc.to_pretty();
-                        edit.editor
-                            .update(cx, |e, cx| e.set_value(text, window, cx));
-                    }
-                    None => edit.error = Some("The document no longer exists".into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    pub(super) fn close_doc_editor(&mut self, cx: &mut Context<Self>) {
-        if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
-            t.doc_edit = None;
-            cx.notify();
-        }
-    }
-
-    pub(super) fn save_doc(&mut self, cx: &mut Context<Self>) {
-        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
-            return;
-        };
-        let Some(edit) = &t.doc_edit else { return };
-        let text = edit.editor.read(cx).value().trim().to_string();
-        let coll = collection_expr(&t.object.name);
-        let (cmd, done) = match (edit.mode, &edit.id) {
-            (DocEditMode::Add, _) => (format!("{coll}.insertOne({text})"), "Document added"),
-            (DocEditMode::Edit, Some(id)) => (
-                format!("{coll}.replaceOne({{ _id: {} }}, {text})", id.to_pretty()),
-                "Document saved",
-            ),
-            _ => return,
-        };
-        self.run_doc_command(cmd, done, cx);
-    }
-
-    pub(super) fn ask_delete_doc(&mut self, cx: &mut Context<Self>) {
-        if self
-            .selected_doc(cx)
-            .and_then(|d| d.get("_id").cloned())
-            .is_none()
-        {
-            return self.set_status(
-                "Select a document with an _id first (click a row)",
-                true,
-                cx,
-            );
-        }
-        if let Some(Tab::Table(t)) = self.tabs.get_mut(self.active) {
-            t.pending_delete = true;
-            cx.notify();
-        }
-    }
-
-    pub(super) fn delete_doc(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_doc(cx).and_then(|d| d.get("_id").cloned()) else {
-            return;
-        };
-        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
-            return;
-        };
-        let cmd = format!(
-            "{}.deleteOne({{ _id: {} }})",
-            collection_expr(&t.object.name),
-            id.to_pretty()
-        );
-        self.run_doc_command(cmd, "Document deleted", cx);
-    }
-
-    /// Runs one write and reloads the page on success. Errors stay in the panel (or the
-    /// status bar for deletes) so the user can fix the text and retry.
-    fn run_doc_command(&mut self, cmd: String, done: &'static str, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else { return };
-        let req = QueryRequest {
-            session_id: session.session_id,
-            sql: cmd,
-            scope: RunScope::All,
-            params: BTreeMap::new(),
-        };
-        let ix = self.active;
-        if let Some(Tab::Table(t)) = self.tabs.get_mut(ix) {
-            if let Some(e) = t.doc_edit.as_mut() {
-                e.busy = true;
-                e.error = None;
+        dialog.update(cx, |d, cx| match kind {
+            DocDialogKind::Insert => d.set_text(INSERT_TEMPLATE, window, cx),
+            DocDialogKind::Delete => {
+                let scope = d.scope;
+                d.set_scope(scope, window, cx);
             }
-        }
-        cx.notify();
-        let engine = self.engine.clone();
-        cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_spawn(async move { engine.run_query(&req) })
-                .await;
-            this.update(cx, |this, cx| {
-                let error = match &res {
-                    Err(e) => Some(e.to_string()),
-                    Ok(r) => r.iter().find_map(|s| s.error.clone()),
-                };
-                let Some(Tab::Table(t)) = this.tabs.get_mut(ix) else {
-                    return;
-                };
-                t.pending_delete = false;
-                match error {
-                    Some(e) => match t.doc_edit.as_mut() {
-                        Some(edit) => {
-                            edit.busy = false;
-                            edit.error = Some(e);
-                        }
-                        None => this.set_status(e, true, cx),
-                    },
-                    None => {
-                        t.doc_edit = None;
-                        this.set_status(done, false, cx);
-                        if this.active == ix {
-                            this.load_page(cx);
-                        }
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+            _ => d.load(window, cx),
+        });
+        window.open_dialog(cx, move |modal, _, cx| {
+            let title = dialog.read(cx).title();
+            modal.title(title).w(px(760.)).child(dialog.clone())
+        });
     }
 
-    /// Add · View · Edit · Delete, or the delete confirmation in their place.
+    /// Insert · View · Edit · Delete as icon buttons, with the selected `_id` on the right.
     pub(super) fn render_doc_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
             return None;
@@ -283,228 +631,67 @@ impl ThaanApp {
         }
         let theme = cx.theme().clone();
         let read_only = self.session.as_ref().is_some_and(|s| s.read_only);
-        let selected = self.selected_doc(cx);
-        let id_text = selected
-            .as_ref()
-            .and_then(|d| d.get("_id"))
-            .map(|id| id.summary());
-        let bar = h_flex()
-            .h(px(36.))
-            .px_2()
-            .gap_1()
-            .border_b_1()
-            .border_color(theme.border);
-        if t.pending_delete {
-            return Some(
-                bar.bg(theme.danger.opacity(0.08))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(theme.danger)
-                            .child(format!(
-                                "Delete the document with _id {}? This cannot be undone.",
-                                id_text.unwrap_or_default()
-                            )),
-                    )
-                    .child(
-                        Button::new("doc-del-cancel")
-                            .small()
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
-                                    t.pending_delete = false;
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("doc-del-confirm")
-                            .small()
-                            .danger()
-                            .label("Delete")
-                            .on_click(cx.listener(|this, _, _, cx| this.delete_doc(cx))),
-                    )
-                    .into_any_element(),
-            );
-        }
-        let has = selected.is_some();
-        let action = |id: &'static str, ic: &'static str, label: &'static str| {
-            Button::new(id).small().ghost().icon(icon(ic)).label(label)
-        };
-        Some(
-            bar.child(
-                action("doc-add", "plus", "Add")
-                    .disabled(read_only)
-                    .tooltip(if read_only {
-                        "Read-only connection"
-                    } else {
-                        "Add a document"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_doc_editor(DocEditMode::Add, window, cx)
-                    })),
-            )
-            .child(
-                action("doc-view", "eye", "View")
-                    .disabled(!has)
-                    .tooltip("View the selected document")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_doc_editor(DocEditMode::View, window, cx)
-                    })),
-            )
-            .child(
-                action("doc-edit", "pencil", "Edit")
-                    .disabled(!has || read_only)
-                    .tooltip("Edit the selected document")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_doc_editor(DocEditMode::Edit, window, cx)
-                    })),
-            )
-            .child(
-                action("doc-delete", "trash", "Delete")
-                    .disabled(!has || read_only)
-                    .tooltip("Delete the selected document")
-                    .on_click(cx.listener(|this, _, _, cx| this.ask_delete_doc(cx))),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .font_family(theme.mono_font_family.clone())
-                    .child(match id_text {
-                        Some(id) => format!("_id {id}"),
-                        None => "Click a row to select a document".into(),
-                    }),
-            )
-            .into_any_element(),
-        )
-    }
-
-    /// The side panel for viewing, editing or adding a document.
-    pub(super) fn render_doc_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Tab::Table(t)) = self.tabs.get(self.active) else {
-            return None;
-        };
-        let edit = t.doc_edit.as_ref()?;
-        let theme = cx.theme().clone();
-        let read_only = self.session.as_ref().is_some_and(|s| s.read_only);
-        let writing = edit.mode != DocEditMode::View && edit.editable;
-        let title = match edit.mode {
-            DocEditMode::Add => "New document".to_string(),
-            DocEditMode::View => "Document".to_string(),
-            DocEditMode::Edit => "Edit document".to_string(),
-        };
-        let footer = h_flex()
-            .h(px(44.))
-            .px_3()
-            .gap_2()
-            .justify_end()
-            .border_t_1()
-            .border_color(theme.border)
-            .when(
-                edit.mode == DocEditMode::View && !read_only && edit.editable,
-                |d| {
-                    d.child(
-                        Button::new("doc-panel-edit")
-                            .small()
-                            .icon(icon("pencil"))
-                            .label("Edit")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(Tab::Table(t)) = this.tabs.get_mut(this.active) {
-                                    if let Some(e) = t.doc_edit.as_mut() {
-                                        e.mode = DocEditMode::Edit;
-                                    }
-                                }
-                                cx.notify();
-                            })),
-                    )
-                },
-            )
-            .child(
-                Button::new("doc-panel-close")
-                    .small()
-                    .ghost()
-                    .label(if writing { "Cancel" } else { "Close" })
-                    .on_click(cx.listener(|this, _, _, cx| this.close_doc_editor(cx))),
-            )
-            .when(writing, |d| {
-                d.child(
-                    Button::new("doc-panel-save")
-                        .small()
-                        .primary()
-                        .label(if edit.busy {
-                            "Saving…"
-                        } else if edit.mode == DocEditMode::Add {
-                            "Insert"
-                        } else {
-                            "Save"
-                        })
-                        .disabled(edit.busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.save_doc(cx))),
-                )
-            });
-        Some(
-            v_flex()
-                .w(px(440.))
-                .flex_none()
-                .h_full()
-                .border_l_1()
-                .border_color(theme.border)
-                .bg(theme.sidebar)
-                .child(
-                    h_flex()
-                        .h(px(40.))
-                        .px_3()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(div().flex_1().text_sm().font_medium().child(title))
-                        .children(edit.id.as_ref().map(|id| {
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .font_family(theme.mono_font_family.clone())
-                                .child(id.summary())
-                        }))
-                        .child(
-                            Button::new("doc-panel-x")
-                                .ghost()
-                                .xsmall()
-                                .icon(icon("x"))
-                                .on_click(cx.listener(|this, _, _, cx| this.close_doc_editor(cx))),
-                        ),
-                )
-                .when(!edit.editable, |d| {
-                    d.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .text_color(theme.warning)
-                            .child("This document holds binary or special values that the text editor cannot save back without loss, so it opens read-only."),
-                    )
+        let id_text = self
+            .selected_doc(cx)
+            .and_then(|d| d.get("_id").map(|id| id.summary()));
+        let has = id_text.is_some();
+        let action = |id: &'static str, ic: &'static str, tip: &'static str, enabled: bool| {
+            Button::new(id)
+                .small()
+                .ghost()
+                .icon(icon(ic))
+                .tooltip(if read_only && id != "doc-view" {
+                    "Read-only connection"
+                } else {
+                    tip
                 })
-                .children(edit.error.clone().map(|e| {
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .font_family(theme.mono_font_family.clone())
-                        .child(e)
-                }))
+                .disabled(!enabled)
+        };
+        Some(
+            h_flex()
+                .h(px(36.))
+                .px_2()
+                .gap_0p5()
+                .border_b_1()
+                .border_color(theme.border)
                 .child(
-                    div().flex_1().overflow_hidden().child(
-                        Editor::new(&edit.editor)
-                            .readonly(!writing || edit.busy)
-                            .bordered(false)
-                            .h_full(),
+                    action("doc-add", "plus", "Insert document", !read_only).on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.open_doc_dialog(DocDialogKind::Insert, window, cx)
+                        },
+                    )),
+                )
+                .child(
+                    action("doc-view", "eye", "View document", has).on_click(cx.listener(
+                        |this, _, window, cx| this.open_doc_dialog(DocDialogKind::View, window, cx),
+                    )),
+                )
+                .child(
+                    action("doc-edit", "pencil", "Edit document", has && !read_only).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_doc_dialog(DocDialogKind::Edit, window, cx)
+                        }),
                     ),
                 )
-                .child(footer)
+                .child(div().w(px(1.)).h(px(16.)).mx_1().bg(theme.border))
+                .child(
+                    action("doc-delete", "trash", "Delete documents", !read_only).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_doc_dialog(DocDialogKind::Delete, window, cx)
+                        }),
+                    ),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .font_family(theme.mono_font_family.clone())
+                        .child(match id_text {
+                            Some(id) => format!("_id {id}"),
+                            None => "No document selected".into(),
+                        }),
+                )
                 .into_any_element(),
         )
     }

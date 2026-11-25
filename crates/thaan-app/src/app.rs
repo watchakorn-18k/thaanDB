@@ -6,7 +6,6 @@ mod doc_editor;
 #[path = "home.rs"]
 mod home;
 
-use doc_editor::DocEdit;
 
 use crate::docview::{view_switch, DocPanel, DocView};
 use crate::grid::ResultGrid;
@@ -28,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use thaan_core::commands::builtin_commands;
+use thaan_core::commands::{builtin_commands, CommandSpec};
 use thaan_core::connection::ConnectionConfig;
 use thaan_core::driver::{DriverInfo, ParamKind};
 use thaan_core::engine::{Engine, QueryRequest, RunScope, SessionInfo, StatementResult, TablePage};
@@ -139,10 +138,6 @@ struct TableTab {
     /// MongoDB: projection and sort documents next to the filter document.
     projection: Entity<InputState>,
     sort_doc: Entity<InputState>,
-    /// MongoDB: the view / edit / add panel, if open.
-    doc_edit: Option<DocEdit>,
-    /// MongoDB: the delete confirmation is showing.
-    pending_delete: bool,
     error: Option<String>,
     loading: bool,
 }
@@ -218,6 +213,9 @@ pub struct ThaanApp {
     next_query: usize,
     palette_open: bool,
     palette_input: Entity<InputState>,
+    /// Highlighted row in the palette (index into `palette_layout().0`).
+    palette_sel: usize,
+    palette_scroll: ScrollHandle,
     status: Option<(SharedString, bool)>,
     /// Home screen and New connection dialog state.
     home: home::HomeState,
@@ -242,8 +240,27 @@ impl ThaanApp {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands"));
         cx.subscribe(&tree_filter, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
-        cx.subscribe(&palette_input, |_, _, _: &InputEvent, cx| cx.notify())
-            .detach();
+        cx.subscribe_in(
+            &palette_input,
+            window,
+            |this, _, ev: &InputEvent, window, cx| {
+                match ev {
+                    InputEvent::PressEnter { .. } => {
+                        let (items, _) = this.palette_layout(cx);
+                        if let Some(c) = items.get(this.palette_sel) {
+                            this.run_palette_command(c.id, window, cx);
+                        }
+                    }
+                    InputEvent::Change => {
+                        this.palette_sel = 0;
+                        this.palette_scroll.scroll_to_item(0);
+                    }
+                    _ => {}
+                }
+                cx.notify()
+            },
+        )
+        .detach();
         // Redraw twice a minute so "fetched … ago" in the status bar stays current.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -276,6 +293,8 @@ impl ThaanApp {
             next_query: 1,
             palette_open: false,
             palette_input,
+            palette_sel: 0,
+            palette_scroll: ScrollHandle::new(),
             status: None,
             home,
         }
@@ -628,8 +647,6 @@ impl ThaanApp {
             docs,
             projection,
             sort_doc,
-            doc_edit: None,
-            pending_delete: false,
             error: None,
             loading: false,
         })));
@@ -994,6 +1011,7 @@ impl ThaanApp {
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = !self.palette_open;
+        self.palette_sel = 0;
         if self.palette_open {
             self.palette_input.update(cx, |s, cx| {
                 s.set_value("", window, cx);
@@ -1005,8 +1023,67 @@ impl ThaanApp {
         cx.notify();
     }
 
+    /// Commands in display order (grouped by category) and, for each, its child index in
+    /// the scrolling list, which also holds one label row per group. With an empty search
+    /// only commands this window can run are listed; a search also finds CLI-only ones.
+    fn palette_layout(&self, cx: &App) -> (Vec<CommandSpec>, Vec<usize>) {
+        let q = self.palette_input.read(cx).value().trim().to_lowercase();
+        let matches: Vec<CommandSpec> = builtin_commands()
+            .into_iter()
+            .filter(|c| {
+                if q.is_empty() {
+                    // Without a session, hide what needs one (running queries, tabs…).
+                    // Clearing history is left to search, so Enter on an unchanged
+                    // list never erases anything.
+                    gui_runs(c.id) && (self.session.is_some() || c.id == "app.toggleTheme")
+                } else {
+                    c.title.to_lowercase().contains(&q)
+                        || c.id.to_lowercase().contains(&q)
+                        || c.category.to_lowercase().contains(&q)
+                }
+            })
+            .collect();
+        let mut categories: Vec<&str> = Vec::new();
+        for c in &matches {
+            if !categories.contains(&c.category) {
+                categories.push(c.category);
+            }
+        }
+        let mut items = Vec::new();
+        let mut child_ix = Vec::new();
+        let mut next = 0;
+        for cat in categories {
+            next += 1; // the group label
+            for c in matches.iter().filter(|c| c.category == cat) {
+                items.push(c.clone());
+                child_ix.push(next);
+                next += 1;
+            }
+        }
+        (items, child_ix)
+    }
+
+    fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let (items, child_ix) = self.palette_layout(cx);
+        if items.is_empty() {
+            return;
+        }
+        let n = items.len() as isize;
+        self.palette_sel = (self.palette_sel as isize + delta).rem_euclid(n) as usize;
+        // Keep the group label in view when the first row of a group is selected.
+        let ix = child_ix[self.palette_sel];
+        self.palette_scroll
+            .scroll_to_item(if ix > 0 && child_ix.first() == Some(&ix) {
+                0
+            } else {
+                ix
+            });
+        cx.notify();
+    }
+
     fn run_palette_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
+        window.focus(&self.focus, cx);
         match id {
             "query.runAll" => self.run(false, cx),
             "query.runCurrent" | "query.runSelection" => self.run(true, cx),
@@ -1030,6 +1107,27 @@ impl ThaanApp {
         }
         cx.notify();
     }
+}
+
+/// Commands this window carries out itself; keep in step with `run_palette_command`.
+fn gui_runs(id: &str) -> bool {
+    matches!(
+        id,
+        "query.runAll"
+            | "query.runCurrent"
+            | "query.runSelection"
+            | "tab.new"
+            | "tab.close"
+            | "schema.refresh"
+            | "schema.listObjects"
+            | "connection.close"
+            | "app.toggleTheme"
+            | "savedQuery.save"
+            | "history.list"
+            | "savedQuery.list"
+            | "result.export"
+            | "history.clear"
+    )
 }
 
 fn is_ddl(sql: &str) -> bool {
@@ -1936,19 +2034,14 @@ impl ThaanApp {
             .children(filter_bar)
             .children(self.render_doc_bar(cx))
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(body),
-                    )
-                    .children(self.render_doc_editor(cx)),
+                h_flex().flex_1().min_h_0().overflow_hidden().child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(body),
+                ),
             )
             .into_any_element()
     }
@@ -2147,16 +2240,99 @@ impl ThaanApp {
 
     fn render_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let q = self.palette_input.read(cx).value().to_lowercase();
-        let cmds: Vec<_> = builtin_commands()
-            .into_iter()
-            .filter(|c| {
-                q.is_empty()
-                    || c.title.to_lowercase().contains(&q)
-                    || c.id.to_lowercase().contains(&q)
-            })
-            .take(12)
-            .collect();
+        let (items, _) = self.palette_layout(cx);
+        let sel = self.palette_sel.min(items.len().saturating_sub(1));
+        let searching = !self.palette_input.read(cx).value().trim().is_empty();
+
+        let mut list = v_flex()
+            .id("palette-list")
+            .track_scroll(&self.palette_scroll)
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2();
+        let mut last_cat = "";
+        for (i, c) in items.iter().enumerate() {
+            if c.category != last_cat {
+                last_cat = c.category;
+                list = list.child(
+                    group_label(c.category, None, &theme)
+                        .flex_none()
+                        .px_2()
+                        .pt(px(if i == 0 { 4. } else { 12. }))
+                        .pb_1(),
+                );
+            }
+            let id = c.id;
+            let runs_here = gui_runs(id);
+            list = list.child(
+                h_flex()
+                    .id(("cmd", i))
+                    .flex_none()
+                    .h(px(32.))
+                    .px_2()
+                    .gap_3()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(i == sel, |d| d.bg(theme.list_hover))
+                    .hover(|s| s.bg(theme.list_hover))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .when(!runs_here, |d| d.text_color(theme.muted_foreground))
+                            .child(c.title),
+                    )
+                    .when(!runs_here, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .child("CLI"),
+                        )
+                    })
+                    .children(c.shortcut.and_then(kbd))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_palette_command(id, window, cx)
+                    })),
+            );
+        }
+        if items.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("No matching commands"),
+            );
+        }
+
+        let hint = |keys: &[&'static str], label: &'static str| {
+            h_flex()
+                .gap_1()
+                .children(keys.iter().filter_map(|k| kbd(k)))
+                .child(div().pl_0p5().child(label))
+        };
+        let footer = h_flex()
+            .h(px(36.))
+            .flex_none()
+            .px_4()
+            .gap_4()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(hint(&["up", "down"], "Move"))
+            .child(hint(&["enter"], "Run"))
+            .child(hint(&["escape"], "Close"))
+            .child(div().flex_1())
+            .when(!searching, |d| d.child("Type to search CLI commands too"));
+
         div()
             .absolute()
             .inset_0()
@@ -2168,42 +2344,38 @@ impl ThaanApp {
                 v_flex()
                     .id("palette")
                     .w(px(560.))
-                    .max_h(px(440.))
+                    .h(px(440.))
                     .rounded(px(12.))
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.popover)
                     .shadow_lg()
-                    .p_2()
-                    .gap_0p5()
+                    .overflow_hidden()
+                    .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        match ev.keystroke.key.as_str() {
+                            "up" => this.move_palette_selection(-1, cx),
+                            "down" => this.move_palette_selection(1, cx),
+                            "escape" => {
+                                this.palette_open = false;
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            }
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.palette_open = false;
                         cx.notify();
                     }))
-                    .child(div().pb_1().child(Input::new(&self.palette_input)))
-                    .children(cmds.into_iter().enumerate().map(|(i, c)| {
-                        let id = c.id;
-                        h_flex()
-                            .id(("cmd", i))
+                    .child(
+                        div()
                             .flex_none()
-                            .h(px(32.))
-                            .px_2()
-                            .gap_3()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.list_hover))
-                            .child(div().flex_1().text_sm().truncate().child(c.title))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(c.category),
-                            )
-                            .children(c.shortcut.and_then(kbd))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run_palette_command(id, window, cx)
-                            }))
-                    })),
+                            .p_2()
+                            .child(Input::new(&self.palette_input).prefix(icon("search").size_4())),
+                    )
+                    .child(list)
+                    .child(footer),
             )
     }
 }

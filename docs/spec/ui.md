@@ -45,8 +45,12 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
   toolbars and the header 36px.
 - Shortcuts are drawn as keycaps. Copy says `1 row` / `6 rows`, never `row(s)`, and short
   labels and empty states end without a period.
-- The table footer keeps two labelled groups: *Export* (writes a file) and *Copy as*
-  (clipboard).
+- Table tabs keep one bottom status bar; its *Export* menu holds the file exports and the
+  clipboard copies (workspace.md §5).
+- Command palette: commands grouped under their category label, shortcuts as `Kbd`, ↑ ↓ to
+  move, ↵ to run, Esc to close. An empty search lists only what this window can run right
+  now (without a connection, just the theme toggle); typing also finds CLI-only commands,
+  shown muted with a `CLI` tag. Nothing destructive is preselected.
 
 ## Data-driven UI
 
