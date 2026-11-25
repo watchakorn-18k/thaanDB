@@ -15,8 +15,16 @@ is taken; layout details, wording, icons and colours are ours (`docs/clean-room.
     icon, its name, its connection count in muted mono and a delete button. Clicking the row
     folds or unfolds it (view state only). Its connections sit under it, indented.
   - **Then connections in no group.** Each row: database logo, name, colour dot, delete.
-    Clicking a row connects; right-click offers *Move to group* (every other group) and
-    *Remove from group*.
+    Clicking a row connects.
+  - **Right-click a connection:** Connect, Duplicate (saved as "… copy" right below), Copy ▸
+    (name, file or host), Move to group ▸ (every group, its current one greyed, then
+    *No group*), New group…, and *Delete connection…* in the danger colour (asks first).
+  - **Right-click a group:** New group…, *Delete group…* (asks first).
+  - **Drag a connection** (press, hold, move): drop it on another connection to place it
+    just above that one, in that connection's group (a 2px accent line marks the spot);
+    on a group header to move it to the end of that group (the header highlights and the
+    group unfolds); on the empty space below the list to take it out of any group. The
+    order is saved (`connection.moveToFolder` with `before`).
   - A search shows groups whose name or connections match, unfolded.
 - **New group:** a small dialog with a name box (Enter or *Create*). Names are unique,
   ignoring case. An empty group stays until it is deleted.

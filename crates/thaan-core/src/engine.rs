@@ -288,6 +288,39 @@ impl Engine {
         Ok(out)
     }
 
+    /// Moves a connection into `folder` (`None`: no group) and puts it just before the
+    /// connection `before`, or last when `before` is `None` or unknown. Drag and drop in the
+    /// sidebar uses this; the list order is the saved order.
+    pub fn place_connection(
+        &self,
+        id: &str,
+        folder: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<ConnectionConfig> {
+        let folder = folder.map(str::trim).filter(|f| !f.is_empty());
+        let mut s = self.store();
+        let from = s
+            .data
+            .connections
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| Error::UnknownConnection(id.into()))?;
+        let mut c = s.data.connections.remove(from);
+        c.folder = folder.map(String::from);
+        let to = before
+            .filter(|b| *b != id)
+            .and_then(|b| s.data.connections.iter().position(|x| x.id == b))
+            .unwrap_or(s.data.connections.len());
+        s.data.connections.insert(to, c.clone());
+        if let Some(f) = folder {
+            if !s.data.folders.iter().any(|x| x == f) {
+                s.data.folders.push(f.to_string());
+            }
+        }
+        s.save()?;
+        Ok(c)
+    }
+
     pub fn test_connection(&self, c: &ConnectionConfig) -> TestResult {
         let t = Instant::now();
         let r = self
@@ -713,6 +746,37 @@ mod tests {
         assert_eq!(e.connections().len(), 1);
         assert!(e.delete_folder("Nope").is_err());
         assert!(e.move_connection("missing", None).is_err());
+    }
+
+    #[test]
+    fn place_connection_orders_and_regroups() {
+        let e = Engine::new(Store::in_memory());
+        for id in ["a", "b", "c"] {
+            e.store().data.connections.push(ConnectionConfig {
+                id: id.into(),
+                name: id.into(),
+                ..Default::default()
+            });
+        }
+        let ids = |e: &Engine| {
+            e.connections()
+                .into_iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        };
+        // Drop "c" on "a": it goes just before "a", into a's group (none).
+        e.place_connection("c", None, Some("a")).unwrap();
+        assert_eq!(ids(&e), ["c", "a", "b"]);
+        // Drop "c" on a group header: last, in that group, which is created.
+        let c = e.place_connection("c", Some("Prod"), None).unwrap();
+        assert_eq!(c.folder.as_deref(), Some("Prod"));
+        assert_eq!(ids(&e), ["a", "b", "c"]);
+        assert_eq!(e.folders(), ["Prod"]);
+        // Dropping on itself, or before an unknown id, keeps it last.
+        e.place_connection("c", Some("Prod"), Some("c")).unwrap();
+        e.place_connection("c", Some("Prod"), Some("zzz")).unwrap();
+        assert_eq!(ids(&e), ["a", "b", "c"]);
+        assert!(e.place_connection("zzz", None, None).is_err());
     }
 
     #[test]

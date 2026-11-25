@@ -70,6 +70,142 @@ impl HomeState {
     }
 }
 
+/// What a dragged connection carries; it also draws itself under the pointer.
+#[derive(Clone)]
+struct DraggedConn {
+    id: String,
+    name: SharedString,
+    driver: String,
+}
+
+impl Render for DraggedConn {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .h(px(ROW_H))
+            .px_2()
+            .gap_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .shadow_md()
+            .text_sm()
+            .child(
+                db_icon(&self.driver)
+                    .size_4()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(self.name.clone())
+    }
+}
+
+/// A menu row in the danger colour, for actions that remove something.
+fn danger_item(label: &'static str) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        h_flex()
+            .gap_2()
+            .text_color(cx.theme().danger)
+            .child(icon("trash").size_4())
+            .child(label)
+    })
+}
+
+/// The right-click menu of a saved connection.
+fn conn_menu(
+    menu: PopupMenu,
+    this: &Entity<ThaanApp>,
+    c: &ConnectionConfig,
+    folders: &[String],
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let on = |f: fn(&mut ThaanApp, &ConnectionConfig, &mut Window, &mut Context<ThaanApp>)| {
+        let this = this.clone();
+        let c = c.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            this.update(cx, |app, cx| f(app, &c, window, cx))
+        }
+    };
+    let (copy_name, copy_target) = (c.name.clone(), conn_target(c));
+    let groups: Vec<String> = folders.to_vec();
+    let current = c.folder.clone();
+    let move_this = this.clone();
+    let move_id = c.id.clone();
+    menu.item(
+        PopupMenuItem::new("Connect")
+            .icon(icon("plug"))
+            .on_click(on(|app, c, window, cx| app.connect(c.clone(), window, cx))),
+    )
+    .item(
+        PopupMenuItem::new("Duplicate")
+            .icon(icon("copy"))
+            .on_click(on(|app, c, _, cx| app.duplicate_connection(c.clone(), cx))),
+    )
+    .submenu_with_icon(
+        Some(icon("clipboard")),
+        "Copy",
+        window,
+        cx,
+        move |m, _, _| {
+            let (n, t) = (copy_name.clone(), copy_target.clone());
+            m.item(PopupMenuItem::new("Name").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(n.clone()))
+            }))
+            .item(
+                PopupMenuItem::new("File or host").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(t.clone()))
+                }),
+            )
+        },
+    )
+    .separator()
+    .submenu_with_icon(
+        Some(icon("folder-input")),
+        "Move to group",
+        window,
+        cx,
+        move |mut m, _, _| {
+            for g in &groups {
+                let (this, id, g2) = (move_this.clone(), move_id.clone(), g.clone());
+                let here = current.as_deref() == Some(g.as_str());
+                m = m.item(
+                    PopupMenuItem::new(g.clone())
+                        .icon(icon("folder"))
+                        .disabled(here)
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |app, cx| {
+                                app.move_to_group(id.clone(), Some(g2.clone()), cx)
+                            })
+                        }),
+                );
+            }
+            if !groups.is_empty() {
+                m = m.separator();
+            }
+            let (this, id) = (move_this.clone(), move_id.clone());
+            m.item(
+                PopupMenuItem::new("No group")
+                    .disabled(current.is_none())
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |app, cx| app.move_to_group(id.clone(), None, cx))
+                    }),
+            )
+        },
+    )
+    .item(
+        PopupMenuItem::new("New group…")
+            .icon(icon("folder-plus"))
+            .on_click(on(|app, _, window, cx| app.open_group_dialog(window, cx))),
+    )
+    .separator()
+    .item(
+        danger_item("Delete connection…").on_click(on(|app, c, window, cx| {
+            app.confirm_delete_connection(c.id.clone(), c.name.clone(), window, cx)
+        })),
+    )
+}
+
 /// Database families, used to group the driver grid. Our own grouping.
 fn family(driver_id: &str) -> &'static str {
     match driver_id {
@@ -364,7 +500,93 @@ impl ThaanApp {
             .filter(|s| s != NO_GROUP)
     }
 
+    /// Drag and drop: puts a connection in `folder`, just above `before` (or last), right
+    /// away in the view and then in the store, in the background.
+    fn place_connection(
+        &mut self,
+        id: String,
+        folder: Option<String>,
+        before: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if before.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if let Some(from) = self.connections.iter().position(|c| c.id == id) {
+            let mut c = self.connections.remove(from);
+            c.folder = folder.clone();
+            let to = before
+                .as_deref()
+                .and_then(|b| self.connections.iter().position(|x| x.id == b))
+                .unwrap_or(self.connections.len());
+            self.connections.insert(to, c);
+        }
+        if let Some(f) = &folder {
+            if !self.home.folders.contains(f) {
+                self.home.folders.push(f.clone());
+            }
+            self.home.collapsed.remove(f);
+        }
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    engine
+                        .place_connection(&id, folder.as_deref(), before.as_deref())
+                        .map(|_| (engine.folders(), engine.connections()))
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok((folders, conns)) => {
+                    this.home.folders = folders;
+                    this.connections = conns;
+                    cx.notify();
+                }
+                Err(e) => this.set_status(format!("Move failed: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Saves a copy of a connection, named "… copy", right after it in the same group.
+    fn duplicate_connection(&mut self, c: ConnectionConfig, cx: &mut Context<Self>) {
+        let mut copy = c.clone();
+        copy.id = String::new();
+        copy.name = format!("{} copy", c.name);
+        let engine = self.engine.clone();
+        let after = c.id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    let saved = engine.save_connection(copy)?;
+                    // Put the copy right below the original.
+                    let conns = engine.connections();
+                    let next = conns
+                        .iter()
+                        .position(|x| x.id == after)
+                        .and_then(|i| conns.get(i + 1))
+                        .map(|x| x.id.clone())
+                        .filter(|n| *n != saved.id);
+                    engine.place_connection(&saved.id, saved.folder.as_deref(), next.as_deref())?;
+                    Ok::<_, thaan_core::Error>((saved.name, engine.connections()))
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok((name, conns)) => {
+                    this.connections = conns;
+                    this.set_status(format!("Saved “{name}”"), false, cx);
+                }
+                Err(e) => this.set_status(format!("Duplicate failed: {e}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// One saved connection in the home sidebar. `indent` puts it under a group header.
+    /// Drag it to reorder or regroup; drop on it to put the dragged one above it.
     fn home_conn_row(
         &self,
         i: usize,
@@ -382,9 +604,11 @@ impl ThaanApp {
         let name = c.name.clone();
         let this = cx.entity();
         let folders = self.home.folders.clone();
-        let current = c.folder.clone();
-        let menu_id = c.id.clone();
         let conn = c.clone();
+        let menu_conn = c.clone();
+        let drop_folder = c.folder.clone();
+        let drop_before = c.id.clone();
+        let accent = theme.primary;
         h_flex()
             .id(("home-conn", i))
             .flex_none()
@@ -393,6 +617,9 @@ impl ThaanApp {
             .pr_2()
             .pl(px(if indent { 28. } else { 8. }))
             .rounded(px(6.))
+            // A 2px line above the row shows where a dragged connection will land.
+            .border_t_2()
+            .border_color(transparent_black())
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(theme.sidebar_accent))
@@ -417,41 +644,31 @@ impl ThaanApp {
             .on_click(
                 cx.listener(move |this, _, window, cx| this.connect(conn.clone(), window, cx)),
             )
-            .context_menu(move |menu, _, _| {
-                let mut menu = menu.label("Move to group");
-                for f in &folders {
-                    if current.as_deref() == Some(f.as_str()) {
-                        continue;
-                    }
-                    let this = this.clone();
-                    let id = menu_id.clone();
-                    let f2 = f.clone();
-                    menu = menu.item(PopupMenuItem::new(f.clone()).on_click(move |_, _, cx| {
-                        this.update(cx, |app, cx| {
-                            app.move_to_group(id.clone(), Some(f2.clone()), cx)
-                        })
-                    }));
-                }
-                if folders.is_empty() {
-                    menu = menu.label("No groups yet");
-                }
-                if current.is_some() {
-                    let this = this.clone();
-                    let id = menu_id.clone();
-                    menu = menu
-                        .separator()
-                        .item(
-                            PopupMenuItem::new("Remove from group").on_click(move |_, _, cx| {
-                                this.update(cx, |app, cx| app.move_to_group(id.clone(), None, cx))
-                            }),
-                        );
-                }
-                menu
+            .on_drag(
+                DraggedConn {
+                    id: c.id.clone(),
+                    name: c.name.clone().into(),
+                    driver: c.driver.clone(),
+                },
+                |d, _, _, cx| cx.new(|_| d.clone()),
+            )
+            .drag_over::<DraggedConn>(move |s, _, _, _| s.border_color(accent))
+            .on_drop(cx.listener(move |this, d: &DraggedConn, _, cx| {
+                this.place_connection(
+                    d.id.clone(),
+                    drop_folder.clone(),
+                    Some(drop_before.clone()),
+                    cx,
+                )
+            }))
+            .context_menu(move |menu, window, cx| {
+                conn_menu(menu, &this, &menu_conn, &folders, window, cx)
             })
             .into_any_element()
     }
 
-    /// A group header: chevron, folder, name and count. Click folds it; trash deletes it.
+    /// A group header: chevron, folder, name and count. Click folds it; trash deletes it;
+    /// dropping a connection on it moves the connection into the group.
     fn home_group_row(
         &self,
         gi: usize,
@@ -463,6 +680,10 @@ impl ThaanApp {
         let theme = cx.theme().clone();
         let toggle = name.to_string();
         let del = name.to_string();
+        let drop_into = name.to_string();
+        let menu_name = name.to_string();
+        let this = cx.entity();
+        let hover = theme.sidebar_accent;
         h_flex()
             .id(("home-group", gi))
             .flex_none()
@@ -470,6 +691,8 @@ impl ThaanApp {
             .gap_2()
             .px_2()
             .rounded(px(6.))
+            .border_t_2()
+            .border_color(transparent_black())
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(theme.sidebar_accent))
@@ -518,6 +741,29 @@ impl ThaanApp {
                 }
                 cx.notify();
             }))
+            .drag_over::<DraggedConn>(move |s, _, _, _| s.bg(hover))
+            .on_drop(cx.listener(move |this, d: &DraggedConn, _, cx| {
+                this.place_connection(d.id.clone(), Some(drop_into.clone()), None, cx)
+            }))
+            .context_menu(move |menu, _, _| {
+                let new_group = this.clone();
+                let delete = this.clone();
+                let name = menu_name.clone();
+                menu.item(
+                    PopupMenuItem::new("New group…")
+                        .icon(icon("folder-plus"))
+                        .on_click(move |_, window, cx| {
+                            new_group.update(cx, |app, cx| app.open_group_dialog(window, cx))
+                        }),
+                )
+                .separator()
+                .item(danger_item("Delete group…").on_click(move |_, window, cx| {
+                    let name = name.clone();
+                    delete.update(cx, |app, cx| {
+                        app.confirm_delete_group(name, count, window, cx)
+                    })
+                }))
+            })
             .into_any_element()
     }
 
@@ -624,7 +870,20 @@ impl ThaanApp {
                                     .child("No saved connections yet"),
                             )
                         })
-                        .children(rows),
+                        .children(rows)
+                        .child({
+                            let accent = theme.primary;
+                            div()
+                                .id("home-drop-end")
+                                .flex_1()
+                                .min_h(px(40.))
+                                .border_t_2()
+                                .border_color(transparent_black())
+                                .drag_over::<DraggedConn>(move |s, _, _, _| s.border_color(accent))
+                                .on_drop(cx.listener(|this, d: &DraggedConn, _, cx| {
+                                    this.place_connection(d.id.clone(), None, None, cx)
+                                }))
+                        }),
                 );
 
         // ---- overview ----

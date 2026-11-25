@@ -113,7 +113,7 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "connection.moveToFolder",
             "Move connection to group",
             "Connection",
-            "{id, folder?} (no folder: out of its group)",
+            "{id, folder?, before?} (no folder: out of its group; before: place above that connection)",
             None,
             true
         ),
@@ -411,7 +411,12 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
         "connection.moveToFolder" => {
             let id: String = p(&params["id"])?;
             let folder: Option<String> = p(&params["folder"]).unwrap_or(None);
-            serde_json::to_value(e.move_connection(&id, folder.as_deref())?)?
+            let before: Option<String> = p(&params["before"]).unwrap_or(None);
+            let c = match before {
+                Some(b) => e.place_connection(&id, folder.as_deref(), Some(&b))?,
+                None => e.move_connection(&id, folder.as_deref())?,
+            };
+            serde_json::to_value(c)?
         }
         "connection.test" => serde_json::to_value(e.test_connection(&p(params)?))?,
         "connection.open" => {

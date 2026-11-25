@@ -193,7 +193,8 @@ Notes from using them:
 | History rail, queries run | `clock` |
 | Database types (count) | `layers` |
 | Quick connect | `plug` |
-| Connection group (closed / open), new group | `folder` / `folder-open`, `folder-plus` |
+| Connection group (closed / open), new group, move to group | `folder` / `folder-open`, `folder-plus`, `folder-input` |
+| Duplicate, copy to clipboard | `copy`, `clipboard` |
 | Disconnect | `unplug` |
 | Shortcuts card / command palette | `keyboard` / `command` |
 | From the terminal (CLI) | `terminal` |

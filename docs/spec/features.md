@@ -15,7 +15,7 @@ status bar) are specified in `docs/spec/workspace.md`; the rows below link to it
 | Feature | Behaviour | CommandId | Status |
 | --- | --- | --- | --- |
 | Connection list | Saved connections with name, colour label, driver, host/db; grouped in folders | `connection.list` | engine+gui |
-| Connection groups | Create and delete groups (folders) of saved connections; move a connection into or out of a group; deleting a group keeps its connections (home.md) | `connection.listFolders`, `connection.createFolder`, `connection.deleteFolder`, `connection.moveToFolder` | engine+gui |
+| Connection groups | Create and delete groups (folders) of saved connections; move a connection into or out of a group by menu or drag and drop, and reorder by drag; deleting a group keeps its connections (home.md) | `connection.listFolders`, `connection.createFolder`, `connection.deleteFolder`, `connection.moveToFolder` | engine+gui |
 | New / edit / delete connection | Form generated from the driver's parameter schema | `connection.save`, `connection.delete` | engine+gui |
 | Test connection | Connect, run a trivial query (`ping` for MongoDB), report latency or error | `connection.test` | engine+gui |
 | Driver picker | Buttons for every registered driver; the form below is rebuilt from the chosen driver's parameters | — | gui |
