@@ -23,9 +23,11 @@ What runs:
 3. **macOS universal** (`macos-latest`): `scripts/bundle-macos.sh --universal` builds for
    Apple Silicon and Intel and joins them with `lipo`; packed with `ditto` as
    `ThaanDB-<tag>-macos-universal.zip`.
-4. **Release**: both zips and `SHA256SUMS.txt` go on the GitHub release for the tag, with
-   notes generated from the commits. A tag with a dash (`v0.2.0-beta.1`) is marked as a
-   pre-release.
+4. **Release**: both zips and `SHA256SUMS.txt` go on the GitHub release for the tag. The
+   description lists every commit since the previous tag (all commits for the first
+   tag), grouped by Conventional Commit type (Features, Fixes, Performance, Other), with
+   a full-changelog link: `scripts/release-notes.sh <tag>` prints the same notes
+   locally. A tag with a dash (`v0.2.0-beta.1`) is marked as a pre-release.
 
 Only a pushed `v*` tag starts it. *Run workflow* on the Actions tab (manual) runs steps
 1-3 on any branch and keeps the zips as workflow artifacts, without a release.
