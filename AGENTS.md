@@ -99,8 +99,8 @@ These rules make principle 9 concrete. A change that breaks one is not done.
 
 - Use release builds for any speed or memory claim (`cargo build --release -p thaan-app`).
 - Check idle RAM and RAM after opening a large table (Activity Monitor or
-  `ps -o rss= -p <pid>` on macOS/Linux), and note the numbers in the PR when a change can
-  affect them.
+  `ps -o rss= -p <pid>` on macOS/Linux), and note the numbers in the commit message when a
+  change can affect them.
 - Add a test or benchmark for engine hot paths (statement splitting, paging SQL, export
   writers) when changing them.
 
@@ -123,7 +123,7 @@ docs/
   clean-room.md        what sources are allowed
   spec/features.md     behaviour spec + CommandId + status per feature
   spec/ui.md           layout and theme tokens
-CONTRIBUTING.md        licence, clean-room, PR and commit rules
+CONTRIBUTING.md        issues only: no outside pull requests, and why
 LICENSE                Apache-2.0
 ```
 
@@ -178,7 +178,28 @@ cargo fmt --all
 - No secrets in logs, config files or test fixtures. Passwords go to the OS keychain
   through `thaan_core::secrets::SecretStore` (the app's `keychain` feature); the store
   file strips them (`store::SECRET_KEYS`). Without a secret store they stay in memory.
-- Keep PRs focused; every PR description states: *"Clean-room: written from docs/spec and
-  public docs only."*
-- Licence: Apache-2.0 (`LICENSE`). PR, commit and sign-off rules are in `CONTRIBUTING.md`;
-  the PR template is `.github/pull_request_template.md`.
+- Licence: Apache-2.0 (`LICENSE`). New dependencies use a permissive licence (MIT,
+  Apache-2.0, BSD, Zlib, ISC, or MPL-2.0 as a dependency); no GPL / AGPL / LGPL.
+
+## Outside code
+
+The project takes **no outside code**: pull requests are closed without review and
+`.github/pull_request_template.md` says so (reasons in `CONTRIBUTING.md`). Bugs and ideas
+come in as issues. Never merge, cherry-pick or copy code from a pull request, fork, issue
+or patch someone else wrote, even a small one; write the change here from the issue's
+description instead.
+
+## Commits
+
+- Commit straight to `main`, one topic per commit; keep refactors apart from behaviour
+  changes.
+- Messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `feat(core): add table.truncate command`. Types are `feat`, `fix`, `docs`, `refactor`,
+  `perf`, `test`, `build`, `ci`, `chore`; the scope is the crate without `thaan-`
+  (`core`, `cli`, `app`, `driver-sqlite`, ...). Breaking changes (a CLI flag, the store
+  format, a command's parameters) get `!` (`feat(core)!: ...`) and a line on why.
+- Before committing: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace --exclude thaan-app`, and for `thaan-app`
+  changes a build and a look at the app.
+- Clean-room: every change is written from docs/spec and public docs only
+  (`docs/clean-room.md`).

@@ -118,7 +118,7 @@ rules for all contributors.)
 - [ ] Every wait over ~100 ms has a loading state in words (spinner, skeleton or progress)
 - [ ] For speed or memory claims, measure a release build
   (`cargo build --release -p thaan-app`; RAM via Activity Monitor or `ps -o rss= -p <pid>`)
-  and put the numbers in the PR
+  and put the numbers in the commit message
 
 ### Known gaps in the app today (fix these first)
 

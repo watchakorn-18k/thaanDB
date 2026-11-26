@@ -1,92 +1,52 @@
 # Contributing to ThaanDB
 
-Thanks for helping. This file covers the rules for issues, code and pull requests.
-For the project layout, principles and commands, read [`AGENTS.md`](AGENTS.md) first.
+## Issues welcome, pull requests closed
 
-## Licence and sign-off
+**ThaanDB does not accept pull requests.** Pull requests are closed without review,
+however small or useful they are.
 
-- ThaanDB is licensed under the [Apache License 2.0](LICENSE). By opening a pull request
-  you agree that your contribution is released under the same licence (Apache-2.0,
-  section 5). There is no separate CLA.
-- Every commit must carry a `Signed-off-by:` line. Add it with `git commit -s`. The
-  sign-off certifies the [Developer Certificate of Origin](https://developercertificate.org/):
-  you wrote the change, or you have the right to submit it under this licence.
-- New dependencies must use a permissive licence (MIT, Apache-2.0, BSD, Zlib, ISC, or
-  MPL-2.0 as a dependency). GPL / AGPL / LGPL dependencies are not accepted.
+ThaanDB is maintained by one person, who does not have the time to review outside code
+line by line. A database client holds passwords and has direct access to people's data,
+so code nobody has reviewed is a real risk: one hidden change could steal credentials or
+ship malware to everyone who installs the next release. Taking no outside code is the
+simplest way to keep every release safe.
 
-## Clean-room rule (required)
+What helps most is a good issue. Bugs and ideas you report shape what gets built next.
 
-ThaanDB is written clean-room. Before contributing, read
-[`docs/clean-room.md`](docs/clean-room.md). In short:
+## Reporting a bug
 
-- Never read, unpack, decompile or reverse-engineer another database client's code or
-  binaries for this project, whether it is proprietary or open source. This includes
-  Electron `app.asar` bundles and source maps.
-- Never copy code, SQL templates, CSS, icons, strings or trademarks from another product.
-- You may describe another client's *behaviour* (what you see as a user) in
-  `docs/spec/`, in your own words.
-- If you have read another client's source for an area, do not implement that area here,
-  and say so in the PR.
+Open an [issue](https://github.com/watchakorn-18k/thaanDB/issues) with:
 
-A pull request that breaks this rule is closed, however useful it is.
+- the ThaanDB version (or commit) and your OS
+- the database and its version, for example PostgreSQL 17 or MongoDB 7
+- the steps to reproduce it, what you expected and what happened instead
+- a screenshot or the error message, if there is one
 
-## Before you start
+Leave out passwords, connection strings with credentials, hostnames and private data.
+Swap them for placeholders such as `postgres://user:***@host/db`.
 
-- **Bugs:** open an issue with the version or commit, OS, database and version, steps to
-  reproduce, and what you expected. Do not include passwords, connection strings with
-  credentials, or private data.
-- **Features:** open an issue or a draft PR that adds or updates the row in
-  [`docs/spec/features.md`](docs/spec/features.md) first, so the behaviour and the
-  `CommandId` can be agreed before the code is written.
-- **Security issues:** do not open a public issue. Contact the maintainers privately.
+## Asking for a feature
 
-## Making a change
+Describe what you want to do and why, not only the button you want. "I want to compare
+two tables' rows before a migration" helps more than "add a diff button".
 
-Follow the steps in `AGENTS.md`. The main points are:
+You may describe how another database client behaves, in your own words or with a
+screenshot of its interface. Never paste code, CSS, SQL templates or other material taken
+from another client: ThaanDB is written clean-room (see
+[`docs/clean-room.md`](docs/clean-room.md)), and such an issue is closed.
 
-1. Put logic in the engine (`thaan-core` or a driver crate), not in `thaan-app`.
-2. Each user-visible action is a command with a stable `CommandId` and typed parameters,
-   registered in `builtin_commands()`. Never rename a `CommandId`; deprecate it instead.
-3. SQL text comes from the `Dialect`. Identifiers are quoted by the dialect, and values are
-   always bound parameters.
-4. Add tests. Engine behaviour is tested against SQLite in-memory databases. Tests that
-   need a live server are `#[ignore]` and read their URL from `THAAN_TEST_<NAME>_URL`.
-5. Do not use `unwrap()` / `expect()` outside tests, except on an invariant with a comment.
-6. Update the status column in `docs/spec/features.md` when a feature lands.
+## Security problems
 
-## Checks
+Do not post a working exploit or the details of a vulnerability in a public issue. Open
+an issue that only asks for a private contact, and send the details once you have one.
 
-A pull request must pass all of these locally:
+## Forks
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --exclude thaan-app
-```
-
-If you touched `thaan-app`, also run `cargo build -p thaan-app` and check the change in
-the app. For UI changes, attach a screenshot.
-
-## Pull request rules
-
-- **One topic per PR.** Keep it small and focused. Split refactors from behaviour changes.
-- **Branch** from `main` and name it `<type>/<short-topic>`, for example
-  `feat/postgres-driver` or `fix/csv-export-quotes`.
-- **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org/):
-  `feat(core): add table.truncate command`, `fix(cli): ...`, `docs: ...`. Types are
-  `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`. Scope is the
-  crate without the `thaan-` prefix (`core`, `cli`, `app`, `driver-sqlite`, ...).
-- **Title** uses the same format as the commit message.
-- **Description** fills in the PR template: what and why, the linked issue, how it was
-  tested, and the clean-room statement:
-  *"Clean-room: written from docs/spec and public docs only."*
-- **No secrets** in code, tests, fixtures, logs or screenshots.
-- **Review:** at least one maintainer approval is needed. Reply to every review comment
-  or resolve it. Squash-merge is the default, so the PR title becomes the commit on `main`.
-- **Breaking changes** (a CLI flag, a stored config format, a command's parameters) must be
-  marked with `!` in the title (`feat(core)!: ...`) and explained in the description.
+ThaanDB is licensed under the [Apache License 2.0](LICENSE). You are free to fork it,
+change it and ship your own build under the terms of that licence. Changes made in a fork
+do not come back into this repository.
 
 ## Code of conduct
 
-Be respectful and constructive. Criticise code, not people. Maintainers may remove
-comments or contributors that harass others.
+Be respectful and constructive. Criticise code and behaviour, not people. Comments or
+accounts that harass others are removed.

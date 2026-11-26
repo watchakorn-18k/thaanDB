@@ -36,6 +36,8 @@ feature set and a layout that users of existing SQL clients find familiar. It is
 - A feature starts as a behaviour spec in `docs/spec/features.md` (what the user sees and
   does), written from the allowed sources above and citing the type of source.
 - Implementation is written only from that spec plus official protocol docs.
-- If a contributor has read another client's source, they must not implement the matching
-  area here. They say so in the PR.
-- Every PR description includes: *"Clean-room: written from docs/spec and public docs only."*
+- Whoever writes the code must not have read another client's source for that area. If
+  they have, someone else implements it.
+- The project takes no outside pull requests (`CONTRIBUTING.md`). Issues may describe
+  another client's behaviour or show screenshots of its interface, but code, CSS or SQL
+  templates pasted from another client are removed and never used.
