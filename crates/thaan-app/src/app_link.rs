@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thaan_core::store::Store;
 
+/// Requests kept while a connect runs.
+const LINK_QUEUE: usize = 20;
+
 /// What a client asked the window to do.
 pub(super) enum LinkAction {
     OpenTable(ObjectRef),
@@ -175,7 +178,7 @@ impl ThaanApp {
         .detach();
     }
 
-    fn handle_link(
+    pub(super) fn handle_link(
         &mut self,
         connection: String,
         action: LinkAction,
@@ -204,10 +207,18 @@ impl ThaanApp {
             self.run_link_action(action, &c.id, window, cx);
             return Ok(format!("Opened {what} on {} in ThaanDB", c.name));
         }
-        if self.connecting {
-            return Err("ThaanDB is busy connecting; try again in a moment".into());
+        // While a connect runs, requests wait their turn instead of failing: an agent
+        // often calls open_table and execute_and_show back to back.
+        if self.link_after_connect.len() >= LINK_QUEUE {
+            return Err("ThaanDB has too many requests waiting for a connection".into());
         }
-        self.link_after_connect = Some((c.id.clone(), action));
+        self.link_after_connect.push((c.id.clone(), action));
+        if self.connecting {
+            return Ok(format!(
+                "ThaanDB is connecting; {what} on {} opens when that is done",
+                c.name
+            ));
+        }
         let name = c.name.clone();
         self.connect(c, window, cx);
         Ok(format!(

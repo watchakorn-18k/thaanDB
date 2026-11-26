@@ -65,7 +65,8 @@ jobs:
           @"
           ThaanDB ${{ github.ref_name }} for Windows (x64)
 
-          Run ThaanDB.exe. thaan.exe is the command-line client.
+          Run ThaanDB.exe. thaan.exe is the command-line client and the MCP server for AI
+          agents (thaan.exe mcp); Settings > MCP in the app shows how to add it.
           Needs Windows 10 (1903 or later) or 11, 64-bit, and the Microsoft Visual C++
           Redistributable 2015-2022 (x64): https://aka.ms/vs/17/release/vc_redist.x64.exe
           The exe is not code-signed: if SmartScreen warns, choose More info, then Run anyway.

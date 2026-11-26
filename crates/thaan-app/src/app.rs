@@ -316,7 +316,8 @@ pub struct ThaanApp {
     /// App preferences (Settings dialog); saved through `Engine::set_settings`.
     settings: thaan_core::store::Settings,
     /// What `thaan mcp` asked to show once this saved connection is connected.
-    link_after_connect: Option<(String, app_link::LinkAction)>,
+    /// What `thaan mcp` asked to show while a connect was running, in order.
+    link_after_connect: Vec<(String, app_link::LinkAction)>,
     /// Settings dialog page and its MCP lookup.
     settings_ui: settings::SettingsUi,
     /// The past query that tab starts with (Recent queries on home), if any.
@@ -416,7 +417,7 @@ impl ThaanApp {
         let mut app = Self {
             settings,
             settings_ui: Default::default(),
-            link_after_connect: None,
+            link_after_connect: Vec::new(),
             engine,
             focus: cx.focus_handle(),
             drivers,
@@ -661,16 +662,20 @@ impl ThaanApp {
                             }
                         }
                         // An agent asked (through `thaan mcp`) to show something here.
-                        if let Some((cid, action)) = this.link_after_connect.take() {
+                        // Requests for this connection run now; the rest go through
+                        // `handle_link` again, which opens their connection in turn.
+                        for (cid, action) in std::mem::take(&mut this.link_after_connect) {
                             if cid == info_connection_id {
                                 this.activate(sid, cx);
                                 this.run_link_action(action, &cid, window, cx);
+                            } else {
+                                this.handle_link(cid, action, window, cx).ok();
                             }
                         }
                         this.set_status("Connected", false, cx);
                     }
                     Err(e) => {
-                        this.link_after_connect = None;
+                        this.link_after_connect.clear();
                         this.open_after_connect = None;
                         this.open_query_after_connect = None;
                         this.set_status(format!("Connection failed: {e}"), true, cx)

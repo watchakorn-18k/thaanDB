@@ -8,6 +8,26 @@ is the stdio loop.
 
 ## Setup
 
+### From the app you downloaded
+
+The server ships inside the app, so there is nothing to build:
+
+- **macOS:** `/Applications/ThaanDB.app/Contents/MacOS/thaan` (next to the app's own
+  binary). The download is not code-signed, so macOS keeps a quarantine flag on it and
+  may refuse to start `thaan` when an agent launches it. Clear the flag once after
+  unzipping: `xattr -dr com.apple.quarantine /Applications/ThaanDB.app`.
+- **Windows:** `thaan.exe`, in the same folder as `ThaanDB.exe`.
+
+**Settings › MCP** in the app finds this binary and shows the exact command or config
+text for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Windsurf, with this
+machine's paths filled in:
+
+```bash
+claude mcp add thaandb -- /Applications/ThaanDB.app/Contents/MacOS/thaan mcp
+```
+
+### From source
+
 Build the CLI once (`cargo build --release -p thaan-cli`), then register it:
 
 ```bash
@@ -71,7 +91,10 @@ duplicate) without seeing them; the keychain entry stays where the app put it.
 listens on 127.0.0.1 (a free port) and writes `app-link.json` next to the store
 (readable by your user only) with the port and a random token; `thaan mcp` sends one
 JSON line with that token per request. The app shows saved connections only, connects
-when needed and brings its window forward. `execute_and_show` runs anything that may
+when needed and brings its window forward. Requests that arrive while a connection is
+still opening wait for it (up to 20) instead of failing, so an agent can call
+`open_table` and `execute_and_show` back to back; a request for another connection
+opens that one once the first is done. `execute_and_show` runs anything that may
 write only in the app (never twice); read-only SQL also runs in the server so the agent
 gets the rows.
 

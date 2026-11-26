@@ -44,7 +44,9 @@ Not done yet:
 
 - **Signing.** Neither build is code-signed. Windows SmartScreen asks first (More info,
   then Run anyway). macOS says the app "cannot be checked for malicious software": right
-  click the app, then Open, or run `xattr -dr com.apple.quarantine ThaanDB.app`. Signing
+  click the app, then Open, or run `xattr -dr com.apple.quarantine ThaanDB.app`. Run
+  the `xattr` form when using the bundled MCP server (`Contents/MacOS/thaan mcp`):
+  Open clears the app, but an agent starting `thaan` directly is still checked. Signing
   and notarizing need an Apple Developer ID and a Windows code-signing certificate stored
   as repository secrets.
 - **Linux** builds.
