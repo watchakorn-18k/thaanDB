@@ -77,10 +77,11 @@ impl ThaanApp {
             return;
         }
         let read_only = self.session.as_ref().is_some_and(|s| s.read_only);
+        let db_label = title.to_string();
         let engine = self.engine.clone();
         let view: AnyView = match kind {
             ViewKind::Keys => cx
-                .new(|cx| KeyBrowser::new(engine, sid, read_only, window, cx))
+                .new(|cx| KeyBrowser::new(engine, sid, db_label, read_only, window, cx))
                 .into(),
             ViewKind::Console => cx
                 .new(|cx| BrokerConsole::new(engine, sid, read_only, window, cx))

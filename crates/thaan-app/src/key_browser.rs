@@ -198,6 +198,8 @@ struct Detail {
 pub struct KeyBrowser {
     engine: Arc<Engine>,
     sid: SessionId,
+    /// The database's name (`db0`), for the command prompt.
+    db: String,
     read_only: bool,
     pattern: Entity<InputState>,
     fuzzy: bool,
@@ -254,6 +256,7 @@ impl KeyBrowser {
     pub fn new(
         engine: Arc<Engine>,
         sid: SessionId,
+        db: String,
         read_only: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -314,7 +317,7 @@ impl KeyBrowser {
             },
         )
         .detach();
-        let cmd_input = input("HGETALL user:1", window, cx);
+        let cmd_input = input("", window, cx);
         cx.subscribe_in(
             &cmd_input,
             window,
@@ -328,6 +331,7 @@ impl KeyBrowser {
         let mut this = Self {
             engine,
             sid,
+            db,
             read_only,
             pattern,
             fuzzy: false,
@@ -2137,6 +2141,8 @@ struct CmdEntry {
     command: String,
     /// The reply as text, or the error.
     out: Result<String, String>,
+    /// The reply's first line names its columns (drawn dimmer).
+    header: bool,
     ms: u64,
 }
 
@@ -2144,6 +2150,19 @@ struct CmdEntry {
 const CMD_KEEP: usize = 200;
 /// Reply rows printed per command; the rest are counted.
 const CMD_ROWS: usize = 500;
+
+/// An error the way Redis said it: no `database error:` wrapper, and without the
+/// empty `with args beginning with:` Redis appends to unknown commands.
+fn error_text(e: &thaan_core::Error) -> String {
+    let msg = match e {
+        thaan_core::Error::Database(m) => m.clone(),
+        other => other.to_string(),
+    };
+    let msg = msg.trim_end();
+    msg.strip_suffix(", with args beginning with:")
+        .unwrap_or(msg)
+        .to_string()
+}
 
 /// A reply as aligned text columns, the way a terminal client prints it.
 fn result_text(rs: &ResultSet) -> String {
@@ -2323,10 +2342,17 @@ impl KeyBrowser {
                 .await;
             this.update(cx, |this, cx| {
                 this.cmd_busy = false;
-                let ms = res.as_ref().map_or(0, |r| r.elapsed_ms);
+                let (out, header, ms) = match res {
+                    Ok(r) => {
+                        let header = !(r.columns.len() == 1 && r.rows.len() == 1);
+                        (Ok(result_text(&r)), header, r.elapsed_ms)
+                    }
+                    Err(e) => (Err(error_text(&e)), false, 0),
+                };
                 this.cmd_log.push_back(CmdEntry {
                     command,
-                    out: res.map(|r| result_text(&r)).map_err(|e| e.to_string()),
+                    out,
+                    header,
                     ms,
                 });
                 while this.cmd_log.len() > CMD_KEEP {
@@ -2340,37 +2366,62 @@ impl KeyBrowser {
         .detach();
     }
 
+    /// Puts a past command back in the prompt.
+    fn recall(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(e) = self.cmd_log.get(ix) {
+            let c = e.command.clone();
+            self.cmd_input.update(cx, |s, cx| {
+                s.set_value(c, window, cx);
+                s.focus(window, cx);
+            });
+        }
+    }
+
     fn render_console(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let entries = self.cmd_log.iter().map(|e| {
+        let prompt = format!("{}>", self.db);
+        let entries = self.cmd_log.iter().enumerate().map(|(ix, e)| {
+            let reply = match &e.out {
+                Ok(t) => v_flex().children(t.lines().enumerate().map(|(i, l)| {
+                    div()
+                        .whitespace_nowrap()
+                        .text_color(if e.header && i == 0 {
+                            theme.muted_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .child(l.to_string())
+                })),
+                Err(err) => v_flex().child(div().text_color(theme.danger).child(err.clone())),
+            };
             v_flex()
                 .gap_1()
-                .pb_3()
+                .pb_4()
                 .child(
                     h_flex()
+                        .id(("cmd", ix))
                         .gap_2()
-                        .child(div().text_color(theme.primary).child("›"))
+                        .cursor_pointer()
+                        .rounded(px(4.))
+                        .hover(|d| d.bg(theme.foreground.opacity(0.04)))
+                        .child(div().text_color(theme.primary).child(prompt.clone()))
                         .child(div().flex_1().child(e.command.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{} ms", e.ms)),
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            if e.ms == 0 {
+                                "<1 ms".to_string()
+                            } else {
+                                format!("{} ms", e.ms)
+                            },
+                        ))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.recall(ix, window, cx)),
                         ),
                 )
-                .child(match &e.out {
-                    Ok(t) => div().pl_4().text_color(theme.muted_foreground).children(
-                        t.lines()
-                            .map(|l| div().whitespace_nowrap().child(l.to_string())),
-                    ),
-                    Err(err) => div().pl_4().text_color(theme.danger).child(err.clone()),
-                })
+                .child(reply)
         });
-        let empty = self.cmd_log.is_empty().then(|| {
-            div()
-                .text_color(theme.muted_foreground)
-                .child("Run any Redis command on this database, e.g. HGETALL user:1 or INFO memory")
-        });
+        let busy = self
+            .cmd_busy
+            .then(|| div().text_color(theme.muted_foreground).child("Running…"));
         v_flex()
             .size_full()
             .child(
@@ -2378,95 +2429,94 @@ impl KeyBrowser {
                     .id("cmd-log")
                     .flex_1()
                     .min_h_0()
-                    .p_3()
+                    .px_4()
+                    .py_3()
                     .overflow_scroll()
                     .track_scroll(&self.cmd_scroll)
                     .text_sm()
                     .font_family(theme.mono_font_family.clone())
-                    .children(empty)
-                    .children(entries),
+                    .child(
+                        div()
+                            .pb_4()
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "Redis on {}. Type a command and press Enter; click a past one to run it again",
+                                self.db
+                            )),
+                    )
+                    .children(entries)
+                    .children(busy),
             )
             .child(
                 h_flex()
                     .flex_none()
-                    .p_3()
+                    .h(px(44.))
+                    .px_4()
                     .gap_2()
                     .border_t_1()
                     .border_color(theme.border)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_sm()
+                    .child(div().text_color(theme.primary).child(prompt))
                     .child(
                         div().flex_1().child(
                             Input::new(&self.cmd_input)
-                                .small()
-                                .prefix(icon("chevron-right").size_3p5()),
+                                .appearance(false)
+                                .font_family(theme.mono_font_family.clone()),
                         ),
-                    )
-                    .child(
-                        Button::new("cmd-run")
-                            .icon(icon("play"))
-                            .label(if self.cmd_busy { "Running…" } else { "Run" })
-                            .small()
-                            .disabled(self.cmd_busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.run_command(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("cmd-clear")
-                            .icon(icon("eraser"))
-                            .ghost()
-                            .small()
-                            .tooltip("Clear the output")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cmd_log.clear();
-                                cx.notify();
-                            })),
                     ),
             )
     }
 
     fn render_right_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let tab = |id: &'static str,
-                   ic: &'static str,
-                   label: &'static str,
-                   t: RightTab,
-                   now: RightTab| {
-            Button::new(id)
-                .icon(icon(ic))
-                .label(label)
-                .ghost()
-                .xsmall()
-                .selected(now == t)
-        };
         let now = self.right_tab;
         h_flex()
-            .h(px(36.))
+            .h(px(44.))
             .flex_none()
-            .px_2()
-            .gap_1()
+            .px_3()
+            .gap_2()
             .border_b_1()
             .border_color(theme.border)
             .child(
-                tab("tab-key", "key-round", "Key", RightTab::Key, now).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.right_tab = RightTab::Key;
+                ButtonGroup::new("right-tabs")
+                    .outline()
+                    .small()
+                    .child(
+                        Button::new("tab-key")
+                            .icon(icon("key-round"))
+                            .label("Key")
+                            .selected(now == RightTab::Key),
+                    )
+                    .child(
+                        Button::new("tab-cmd")
+                            .icon(icon("square-terminal"))
+                            .label("Command line")
+                            .selected(now == RightTab::Console),
+                    )
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                        this.right_tab = match clicks.first() {
+                            Some(1) => RightTab::Console,
+                            _ => RightTab::Key,
+                        };
                         cx.notify();
-                    },
-                )),
+                    })),
             )
-            .child(
-                tab(
-                    "tab-cmd",
-                    "square-terminal",
-                    "Command line",
-                    RightTab::Console,
-                    now,
+            .child(div().flex_1())
+            .when(now == RightTab::Console, |h| {
+                h.child(
+                    Button::new("cmd-clear")
+                        .icon(icon("trash"))
+                        .ghost()
+                        .small()
+                        .tooltip("Clear the output")
+                        .disabled(self.cmd_log.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cmd_log.clear();
+                            cx.notify();
+                        })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.right_tab = RightTab::Console;
-                    cx.notify();
-                })),
-            )
+            })
     }
 }
 
@@ -2509,7 +2559,7 @@ impl Render for KeyBrowser {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings GPUI's own `test` attribute in through `gpui_kit::*`.
-    use super::{base64, build_tree, hex_dump, result_text, ttl_text, TreeRow};
+    use super::{base64, build_tree, error_text, hex_dump, result_text, ttl_text, TreeRow};
     use std::collections::BTreeSet;
     use thaan_core::{Column, ResultSet, Value};
 
@@ -2601,5 +2651,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(result_text(&one), "OK");
+    }
+
+    #[test]
+    fn errors_read_like_redis() {
+        let e = thaan_core::Error::Database(
+            "ERR unknown command 'foo', with args beginning with: ".into(),
+        );
+        assert_eq!(error_text(&e), "ERR unknown command 'foo'");
+        let e = thaan_core::Error::Database("WRONGTYPE Operation against a key".into());
+        assert_eq!(error_text(&e), "WRONGTYPE Operation against a key");
     }
 }

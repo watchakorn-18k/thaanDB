@@ -205,9 +205,14 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
   error shows in `danger` under them. *Set expiry* is a 440px dialog: one labelled
   field, the current state in muted text, *Remove expiry* on the left of the footer.
 - The key pane has two tabs at the top, *Key* (`key-round`) and *Command line*
-  (`square-terminal`), as small ghost buttons with the selected one lifted. The command
-  line is a mono log (`›` in teal, the command, its time on the right, the reply muted
-  and indented, errors in `danger`) over an input with *Run* and a clear button.
+  (`square-terminal`), as one outlined `ButtonGroup`; on *Command line* a trash button
+  sits at the right of the same 44px bar to clear the output. The command line reads
+  like a terminal: a full-height mono log that starts with one muted line naming the
+  database, then per command the prompt (`db0>` in teal), the command and its time
+  (`<1 ms` under a millisecond) on the right; the reply under it in the text colour
+  with its column header muted; errors in `danger` as Redis words them. Clicking a past
+  command puts it back in the prompt. At the bottom a borderless prompt line, `db0>`
+  then the input, 44px over a hairline; Enter runs it, there is no Run button.
 - Key folders: chevron, folder icon, name in mono, count in muted mono; 16px indent per
   level; keys under a folder start past its chevron.
 - Choices of two or three (QoS, All / Received / Sent) are the kit's outlined
