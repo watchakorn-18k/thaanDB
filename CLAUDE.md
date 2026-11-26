@@ -40,8 +40,9 @@
   builds. Regenerate it and `AppIcon.ico` with `scripts/make-windows-icon.sh` when the logo
   or the workspace version changes. Release builds use the Windows GUI subsystem (no console
   window); debug builds keep the console for logs.
-- Releases: pushing a `v*` tag runs `.github/workflows/release.yml` (Windows x64 zip and a
-  universal macOS app on a GitHub release); see `docs/releasing.md`.
+- Releases: only pushing a `v*` tag runs `.github/workflows/release.yml` (Windows x64 zip and
+  a universal macOS app on a GitHub release); a manual run on main refreshes the Cargo
+  cache tags restore from. See `docs/releasing.md`.
 - Cross-compiling for Windows from macOS (`cargo xwin build --release -p thaan-app --target
   x86_64-pc-windows-msvc`) fails in `gpui-pre-windows`: its release build needs `fxc.exe`,
   which only exists on Windows. Build Windows releases on Windows (or CI). A test build from

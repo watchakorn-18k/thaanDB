@@ -27,17 +27,16 @@ What runs:
    notes generated from the commits. A tag with a dash (`v0.2.0-beta.1`) is marked as a
    pre-release.
 
-Pushes to `main` that change `crates/`, `Cargo.toml`, `Cargo.lock`, the bundle script or
-the workflow run steps 1-3 too (zips kept as workflow artifacts, no release); *Run
-workflow* on the Actions tab does the same on demand.
+Only a pushed `v*` tag starts it. *Run workflow* on the Actions tab (manual) runs steps
+1-3 on any branch and keeps the zips as workflow artifacts, without a release.
 
 **Cache.** Each job restores its Cargo cache (`Swatinem/rust-cache`: registry, git deps
-and compiled dependencies, GPUI being most of the time) under one key per job:
-`tests`, `windows-release`, `macos-universal`. Only runs on `main` save it, because GitHub
-scopes caches to a ref: a tag can read `main`'s cache but not an earlier tag's. So keep
-`main` building (it does on every code push) and a tag build only compiles our own crates.
-The first run on a fresh repository fills the cache and is the slow one. A newer push to
-`main` cancels a build still running for an older one.
+and compiled dependencies, GPUI being most of the time) under one key per job: `tests`,
+`windows-release`, `macos-universal`. GitHub scopes caches to a ref: a tag run can
+restore `main`'s cache but not an earlier tag's, so tag runs only restore and the cache
+is saved by runs on `main`. With tag-only triggers, that means a manual *Run workflow*
+on `main`: do one now and then, mainly after `Cargo.lock` changes. When the lockfile has
+changed, a tag run still restores the closest older cache and rebuilds only what differs.
 
 Not done yet:
 

@@ -1,31 +1,22 @@
 # Builds ThaanDB for Windows and macOS when a version tag is pushed, and attaches the
-# zips to a GitHub release for that tag.
+# zips to a GitHub release for that tag. Nothing else starts it automatically.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Pushes to main that touch the code build the same zips as workflow artifacts (no
-# release). They also keep the Cargo cache warm: GitHub caches belong to a ref, and a tag
-# run can read main's cache but not another tag's, so main is where the cache is saved.
-# "Run workflow" on the Actions tab does the same on demand. Builds are not code-signed
-# (see docs/releasing.md).
+# Cache: GitHub keeps a cache per ref, and a tag run can restore main's cache but not
+# an earlier tag's. So tag runs only restore, and main's cache is the one they use. It is
+# saved by "Run workflow" on main (Actions tab, manual only), worth doing after the
+# dependencies change. Builds are not code-signed (see docs/releasing.md).
 name: Release
 
 on:
   push:
     tags: ["v*"]
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "scripts/bundle-macos.sh"
-      - ".github/workflows/release.yml"
+  # Manual only: refreshes main's Cargo cache, or builds zips without a release.
   workflow_dispatch:
 
-# A newer push to main replaces a build still running for an older one; tags never cancel.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 permissions:
   contents: read
