@@ -9,6 +9,7 @@
 use super::*;
 use gpui_kit::component::button::ButtonGroup;
 use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::sidebar::{SidebarItem as _, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::tab::{Tab, TabBar};
 use std::path::PathBuf;
 use thaan_core::store::{Settings, ThemePreference};
@@ -38,9 +39,15 @@ struct McpServerInfo {
     /// `THAAN_HOME` as an absolute path, when the app runs with one (dev builds); the
     /// config passes it on so agents see the same connections as this window.
     home: Option<PathBuf>,
+    /// This machine's folders, so config paths are the real ones: the user's home,
+    /// `%APPDATA%` (Windows), `$XDG_CONFIG_HOME` (Linux) and `$CODEX_HOME`.
+    user_home: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    config_home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
 }
 
-/// MCP clients and how each one takes a server: the place it goes, then the text.
+/// MCP clients, in the order of the tabs.
 const MCP_CLIENTS: [&str; 6] = [
     "Claude Code",
     "Claude Desktop",
@@ -65,8 +72,55 @@ fn find_thaan() -> Option<PathBuf> {
         .map(|p| p.canonicalize().unwrap_or(p))
 }
 
-/// `(where it goes, text to paste)` for one client.
-fn mcp_config(client: usize, info: &McpServerInfo) -> (String, String) {
+/// How one client takes the server.
+enum McpSetup {
+    /// A command to run once.
+    Command(String),
+    /// A config file on this machine and the text to put in it.
+    File {
+        path: String,
+        note: Option<&'static str>,
+        text: String,
+    },
+}
+
+/// Where a client keeps its config on this machine: `rel` under the user's home, or
+/// for apps that follow the OS convention, under its app-data folder.
+fn config_path(info: &McpServerInfo, client: usize) -> String {
+    let home = info.user_home.clone().unwrap_or_else(|| PathBuf::from("~"));
+    // macOS: ~/Library/Application Support; Windows: %APPDATA%; Linux: ~/.config.
+    let app_data = || {
+        if cfg!(target_os = "macos") {
+            home.join("Library/Application Support")
+        } else if cfg!(windows) {
+            info.app_data
+                .clone()
+                .unwrap_or_else(|| home.join("AppData/Roaming"))
+        } else {
+            info.config_home
+                .clone()
+                .unwrap_or_else(|| home.join(".config"))
+        }
+    };
+    let p = match client {
+        1 => app_data().join("Claude").join("claude_desktop_config.json"),
+        2 => home.join(".cursor").join("mcp.json"),
+        3 => app_data().join("Code").join("User").join("mcp.json"),
+        4 => info
+            .codex_home
+            .clone()
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("config.toml"),
+        _ => home
+            .join(".codeium")
+            .join("windsurf")
+            .join("mcp_config.json"),
+    };
+    p.display().to_string()
+}
+
+/// What to show for one client.
+fn mcp_config(client: usize, info: &McpServerInfo) -> McpSetup {
     let cmd = info
         .binary
         .as_ref()
@@ -86,6 +140,11 @@ fn mcp_config(client: usize, info: &McpServerInfo) -> (String, String) {
         let doc = serde_json::json!({ key: { "thaandb": server } });
         serde_json::to_string_pretty(&doc).unwrap_or_default()
     };
+    let file = |note: Option<&'static str>, text: String| McpSetup::File {
+        path: config_path(info, client),
+        note,
+        text,
+    };
     match client {
         0 => {
             let shell = |s: &str| {
@@ -101,25 +160,18 @@ fn mcp_config(client: usize, info: &McpServerInfo) -> (String, String) {
                 .as_deref()
                 .map(|h| format!(" -e THAAN_HOME={}", shell(h)))
                 .unwrap_or_default();
-            (
-                "Run in a terminal".into(),
-                format!("claude mcp add thaandb -s user{env} -- {} mcp", shell(&cmd)),
-            )
+            McpSetup::Command(format!(
+                "claude mcp add thaandb -s user{env} -- {} mcp",
+                shell(&cmd)
+            ))
         }
-        1 => (
-            if cfg!(target_os = "macos") {
-                "Add to ~/Library/Application Support/Claude/claude_desktop_config.json".into()
-            } else {
-                "Add to claude_desktop_config.json (Settings, Developer, Edit config)".into()
-            },
+        1 => file(
+            Some("Restart Claude Desktop after saving"),
             json("mcpServers", false),
         ),
-        2 => (
-            "Add to ~/.cursor/mcp.json".into(),
-            json("mcpServers", false),
-        ),
-        3 => (
-            "Add to .vscode/mcp.json in your project".into(),
+        2 => file(None, json("mcpServers", false)),
+        3 => file(
+            Some("Or .vscode/mcp.json in one project only"),
             json("servers", true),
         ),
         4 => {
@@ -127,18 +179,15 @@ fn mcp_config(client: usize, info: &McpServerInfo) -> (String, String) {
                 .as_deref()
                 .map(|h| format!("\nenv = {{ THAAN_HOME = {} }}", q(h)))
                 .unwrap_or_default();
-            (
-                "Add to ~/.codex/config.toml".into(),
+            file(
+                None,
                 format!(
                     "[mcp_servers.thaandb]\ncommand = {}\nargs = [\"mcp\"]{env}",
                     q(&cmd)
                 ),
             )
         }
-        _ => (
-            "Add to ~/.codeium/windsurf/mcp_config.json".into(),
-            json("mcpServers", false),
-        ),
+        _ => file(None, json("mcpServers", false)),
     }
 }
 
@@ -172,7 +221,7 @@ impl ThaanApp {
             // it also follows the window as it is resized: never wider than the window
             // less 16 on each side.
             let width = (window.viewport_size().width - px(32.)).min(px(720.));
-            let body = this.update(cx, |app, cx| app.settings_dialog(width, cx));
+            let body = this.update(cx, |app, cx| app.settings_dialog(width, window, cx));
             dialog.w(width).title("Settings").child(body)
         });
     }
@@ -186,9 +235,14 @@ impl ThaanApp {
             cx.spawn(async move |this, cx| {
                 let info = cx
                     .background_spawn(async move {
+                        let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
                         McpServerInfo {
                             binary: find_thaan(),
                             home: home.map(|h| std::path::absolute(&h).unwrap_or(h)),
+                            user_home: var("HOME").or_else(|| var("USERPROFILE")),
+                            app_data: var("APPDATA"),
+                            config_home: var("XDG_CONFIG_HOME"),
+                            codex_home: var("CODEX_HOME"),
                         }
                     })
                     .await;
@@ -206,7 +260,12 @@ impl ThaanApp {
 
     /// Page list on the left, the page on the right. In a narrow dialog the pages become
     /// a row of tabs above the page.
-    fn settings_dialog(&mut self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
+    fn settings_dialog(
+        &mut self,
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let page = self.settings_ui.page;
         if width < NARROW_SETTINGS {
             let body = match page {
@@ -234,21 +293,24 @@ impl ThaanApp {
                 .child(v_flex().min_w_0().min_h(px(420.)).child(body))
                 .into_any_element();
         }
-        let nav = |id: &'static str,
-                   label: &'static str,
-                   ic: &str,
-                   p: SettingsPage,
-                   cx: &mut Context<Self>| {
-            Button::new(id)
-                .ghost()
-                .small()
-                .w_full()
-                .justify_start()
+        // The kit's sidebar menu: icons in one column, labels on one line, the current
+        // page on the sidebar's selected background.
+        let this = cx.entity();
+        let item = |label: &'static str, ic: &str, p: SettingsPage| {
+            let this = this.clone();
+            SidebarMenuItem::new(label)
                 .icon(icon(ic))
-                .label(label)
-                .selected(page == p)
-                .on_click(cx.listener(move |this, _, _, cx| this.show_settings_page(p, cx)))
+                .active(page == p)
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |app, cx| app.show_settings_page(p, cx));
+                })
         };
+        let nav = SidebarMenu::new()
+            .gap_0p5()
+            .child(item("General", "sliders-horizontal", SettingsPage::General))
+            .child(item("MCP", "bot", SettingsPage::Mcp))
+            .render("set-nav", window, cx)
+            .into_any_element();
         let body = match page {
             SettingsPage::General => self.settings_body(cx),
             SettingsPage::Mcp => self.mcp_body(cx),
@@ -256,22 +318,17 @@ impl ThaanApp {
         h_flex()
             .items_start()
             .gap_6()
+            .child(div().w(px(148.)).flex_none().child(nav))
+            // Same height on both pages, so switching does not make the dialog jump. The
+            // 8px on top puts the page's first heading on the line of the first label.
             .child(
                 v_flex()
-                    .w(px(148.))
-                    .flex_none()
-                    .gap_0p5()
-                    .child(nav(
-                        "set-page-general",
-                        "General",
-                        "sliders-horizontal",
-                        SettingsPage::General,
-                        cx,
-                    ))
-                    .child(nav("set-page-mcp", "MCP", "bot", SettingsPage::Mcp, cx)),
+                    .flex_1()
+                    .min_w_0()
+                    .min_h(px(420.))
+                    .pt_2()
+                    .child(body),
             )
-            // Same height on both pages, so switching does not make the dialog jump.
-            .child(v_flex().flex_1().min_w_0().min_h(px(420.)).child(body))
             .into_any_element()
     }
 
@@ -280,26 +337,77 @@ impl ThaanApp {
         let muted = theme.muted_foreground;
         let mono = theme.mono_font_family.clone();
         let hint = |text: String| div().text_xs().text_color(muted).child(text);
-        // A mono text block with a copy button in its top-right corner.
-        let well = |id: &'static str, text: String| {
-            h_flex()
-                .items_start()
-                .gap_2()
-                .p_3()
+        let section = |title: &str| div().text_sm().font_medium().child(title.to_string());
+        let label = |text: &str| div().text_sm().child(text.to_string());
+        // The copy button: the kit's Clipboard in a 32px square outline, like a field.
+        let copy = |id: &'static str, text: String| {
+            div()
+                .size_8()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded(px(8.))
-                .bg(theme.muted)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .font_family(mono.clone())
-                        .whitespace_normal()
-                        .child(text.clone()),
-                )
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
                 .child(Clipboard::new(id).value(text).tooltip("Copy"))
         };
-        let section = |title: &str| div().text_sm().font_medium().child(title.to_string());
+        // A read-only one-line field: mono text on the input surface, scrolls sideways
+        // when longer than the field, its copy button beside it.
+        let field = |id: &'static str, text: String| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}-text")))
+                        .flex_1()
+                        .min_w_0()
+                        .h_8()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .overflow_x_scroll()
+                        .text_xs()
+                        .font_family(mono.clone())
+                        .whitespace_nowrap()
+                        .child(text.clone()),
+                )
+                .child(copy(id, text))
+        };
+        // A multi-line code block with its copy button in the top-right corner.
+        let block = |id: &'static str, text: String| {
+            div()
+                .relative()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}-text")))
+                        .p_3()
+                        .pr(px(52.))
+                        .overflow_x_scroll()
+                        .text_xs()
+                        .line_height(px(20.))
+                        .font_family(mono.clone())
+                        .whitespace_nowrap()
+                        .children(text.lines().map(|l| {
+                            // Keep leading spaces: JSON indentation.
+                            div().child(if l.is_empty() {
+                                " ".to_string()
+                            } else {
+                                l.to_string()
+                            })
+                        })),
+                )
+                .child(div().absolute().top_2().right_2().child(copy(id, text)))
+        };
 
         let info = self.settings_ui.mcp.clone();
         let (status, status_color) = match &info {
@@ -308,21 +416,21 @@ impl ThaanApp {
             Some(_) => ("Not built yet", theme.warning),
         };
         let server = match info.as_ref().map(|i| i.binary.clone()) {
-            Some(Some(p)) => well("mcp-path", p.display().to_string()).into_any_element(),
+            Some(Some(p)) => field("mcp-path", p.display().to_string()).into_any_element(),
             Some(None) => v_flex()
                 .gap_2()
                 .child(hint(
                     "Build the thaan command line tool, then open this page again".into(),
                 ))
-                .child(well(
+                .child(field(
                     "mcp-build",
                     "cargo build --release -p thaan-cli".into(),
                 ))
                 .into_any_element(),
-            None => div().h(px(40.)).into_any_element(),
+            None => div().h_8().into_any_element(),
         };
         let client = self.settings_ui.client;
-        let config = info.as_ref().map(|i| mcp_config(client, i));
+        let setup = info.as_ref().map(|i| mcp_config(client, i));
         let store_path = info
             .as_ref()
             .and_then(|i| i.home.clone().map(|h| h.join("store.json")))
@@ -331,7 +439,7 @@ impl ThaanApp {
             .unwrap_or_default();
 
         v_flex()
-            .gap_3()
+            .gap_4()
             .child(
                 v_flex().gap_1().child(section("MCP server")).child(hint(
                     "AI agents such as Claude Code or Cursor use your saved connections \
@@ -346,7 +454,7 @@ impl ThaanApp {
                     .child(
                         h_flex()
                             .justify_between()
-                            .child(div().text_sm().child("Server"))
+                            .child(label("Command path"))
                             .child(
                                 h_flex()
                                     .gap_1p5()
@@ -358,7 +466,7 @@ impl ThaanApp {
                     )
                     .child(server),
             )
-            .child(div().h(px(1.)).my_1().bg(theme.border))
+            .child(div().h(px(1.)).bg(theme.border))
             .child(section("Add to a client"))
             .child(
                 TabBar::new("mcp-clients")
@@ -373,12 +481,30 @@ impl ThaanApp {
                         cx.notify();
                     })),
             )
-            .when_some(config, |el, (place, text)| {
-                el.child(hint(place)).child(well("mcp-config", text))
+            .when_some(setup, |el, setup| match setup {
+                McpSetup::Command(cmd) => el.child(
+                    v_flex()
+                        .gap_2()
+                        .child(label("Run in a terminal"))
+                        .child(field("mcp-command", cmd)),
+                ),
+                McpSetup::File { path, note, text } => el
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(label("Config file"))
+                            .child(field("mcp-file", path))
+                            .children(note.map(|n| hint(n.into()))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(label("Add this to it"))
+                            .child(block("mcp-config", text)),
+                    ),
             })
             .child(
                 div()
-                    .pt_1()
                     .text_xs()
                     .font_family(mono.clone())
                     .text_color(muted)

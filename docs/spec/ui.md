@@ -124,10 +124,12 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
 ## Settings
 
 - A dialog opened by the title bar gear, ⌘, or the palette (`app.settings`), 720 px wide
-  or the window less 16 px a side when that is narrower. On the left, 148 px of ghost
-  page buttons: *General* (`sliders-horizontal`) and *MCP* (`bot`), the current one
-  selected. Below 600 px of dialog the pages become a small segmented `TabBar` above the
-  page. Both pages keep at least 420 px of height so switching does not make it jump.
+  or the window less 16 px a side when that is narrower. On the left, 148 px of the kit's
+  `SidebarMenu`: *General* (`sliders-horizontal`) and *MCP* (`bot`), icons in one column
+  and labels on one line, the current page on the sidebar's selected background. The page
+  starts 8 px down so its first heading sits on the line of the first label. Below 600 px
+  of dialog the pages become a small segmented `TabBar` above the page. Both pages keep
+  at least 420 px of height so switching does not make it jump.
 - *General*: two sections in sentence case, *Appearance* and *Data*, split by a hairline.
   Each row is a label with a muted one-line hint on the left and a small outline
   `ButtonGroup` on the right, the current choice selected; when the row is too narrow
@@ -139,17 +141,24 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
   - Query history: 100 · 500 · 1,000 · 5,000 entries kept.
 - *MCP*: *MCP server* with a muted line saying agents use the saved connections through
   `thaan mcp`, can do anything the app can, and that Read-only keeps them from writing.
-  *Server* with a status on the right (6 px dot + muted text: `Ready` in success green,
-  `Not built yet` in warning, `Looking for thaan` while the background lookup runs),
-  then a mono well (muted fill, 8 px radius, 12 px padding) with the binary path and the
-  kit's `Clipboard` button; when there is none, the `cargo build` line in the same well.
-  A hairline, *Add to a client*, a small segmented `TabBar` (Claude Code, Claude
-  Desktop, Cursor, VS Code, Codex, Windsurf; it scrolls and gets an overflow menu when
-  narrow), a muted line saying where the text goes, and the config in a well with
-  `Clipboard`. Last line: `Connections from <store path>` in muted mono. When the app
-  runs with `THAAN_HOME`, every config passes it on so agents see the same connections.
-  The lookup (a `thaan` release build beside the app's binary, then the same folder,
-  then `PATH`) runs off the UI thread each time the dialog opens.
+  Then *Command path* with a status on the right (6 px dot + muted text: `Ready` in
+  success green, `Not built yet` in warning, `Looking for thaan` while the lookup runs)
+  and the path in a field. A hairline, *Add to a client* and a small segmented `TabBar`
+  (Claude Code, Claude Desktop, Cursor, VS Code, Codex, Windsurf; it scrolls and gets an
+  overflow menu when narrow). Claude Code shows *Run in a terminal* and the `claude mcp
+  add` command; the others show *Config file* with the file's real path on this machine
+  (home folder, and the OS's app-data folder for Claude Desktop and VS Code: Application
+  Support, `%APPDATA%`, `$XDG_CONFIG_HOME`), a muted note where one helps, then *Add this
+  to it* and the config as a code block. Last line: `Connections from <store path>` in
+  muted mono. When the app runs with `THAAN_HOME`, every config passes it on.
+- Fields and code blocks: 8 px radius, hairline border, `background` fill, mono 12 px.
+  A field is one 32 px line that scrolls sideways when the text is longer, with a 32 px
+  square outline copy button (the kit's `Clipboard`) beside it. A code block keeps its
+  lines and indentation (20 px line height, 12 px padding) and has the same copy button
+  in its top-right corner, 8 px in.
+- The lookup (the `thaan` binary: a release build beside the app's binary, then the same
+  folder, then `PATH`; and this machine's folders) runs off the UI thread each time the
+  dialog opens.
 - Changes apply at once; there is no Save button. They are written to the store off the
   UI thread, and a failed save says so in the status bar.
 - General's last line: `Saved in <store path>` in muted mono, so people know where it lives.

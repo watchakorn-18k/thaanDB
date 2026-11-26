@@ -124,9 +124,15 @@ impl McpServer {
                     a => a.clone(),
                 };
                 // Tool failures are results with isError, so the agent can read and fix them.
+                // Every reply and error passes the redaction: no connection secret ever
+                // reaches the agent (see `redact`).
+                let known = self.known_secrets();
                 Ok(match self.call(name, &args) {
-                    Ok(v) => tool_result(&v, false),
-                    Err(e) => tool_result(&json!({ "error": e.to_string() }), true),
+                    Ok(v) => tool_result(&redact(&v, &known), false),
+                    Err(e) => tool_result(
+                        &json!({ "error": redact_text(&e.to_string(), &known) }),
+                        true,
+                    ),
                 })
             }
             "resources/list" => Ok(json!({ "resources": [] })),
@@ -331,6 +337,32 @@ impl McpServer {
         }
     }
 
+    /// Secret values this process holds in memory: saved connections' passwords (the
+    /// store keeps them for the run) and those filled into open sessions from the
+    /// keychain. Longest first, so a longer secret is masked before a part of it.
+    fn known_secrets(&self) -> Vec<String> {
+        let e = &*self.engine;
+        let mut out = Vec::new();
+        let mut add = |c: &ConnectionConfig| {
+            for (k, v) in &c.params {
+                if is_secret_key(k) && !v.is_empty() {
+                    out.push(v.clone());
+                }
+            }
+        };
+        for c in e.connections() {
+            add(&c);
+        }
+        for s in e.sessions() {
+            if let Ok(open) = e.session(s.session_id) {
+                add(&open.connection);
+            }
+        }
+        out.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        out.dedup();
+        out
+    }
+
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionId>> {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -364,10 +396,186 @@ impl McpServer {
             None => return Err(Error::UnknownConnection(key)),
         };
         // Opening can take a while (network); the map is not locked meanwhile.
-        let sid = self.engine.open(config)?.session_id;
+        let sid = match self.engine.open(config.clone()) {
+            Ok(info) => info.session_id,
+            Err(e) => {
+                // The engine filled secrets from the keychain into its own copy; a
+                // driver error may quote them, and they are not in memory anywhere the
+                // reply redaction looks. Mask them here (a keychain read, error path only).
+                let mut secrets: Vec<String> = crate::store::SECRET_KEYS
+                    .iter()
+                    .filter_map(|k| self.engine.secret(&config.id, k))
+                    .chain(
+                        config
+                            .params
+                            .iter()
+                            .filter(|(k, _)| is_secret_key(k))
+                            .map(|(_, v)| v.clone()),
+                    )
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                secrets.sort_by_key(|v| std::cmp::Reverse(v.len()));
+                return Err(Error::Database(redact_text(&e.to_string(), &secrets)));
+            }
+        };
         self.lock_sessions().insert(key, sid);
         Ok(sid)
     }
+}
+
+// ---- secrets ----------------------------------------------------------------------------
+
+/// What a masked secret reads as.
+pub const MASK: &str = "••••••";
+
+/// Parameter names that hold secrets: the store's own list and anything named like one.
+fn is_secret_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    crate::store::SECRET_KEYS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&k))
+        || ["password", "passwd", "passphrase", "secret", "token", "apikey", "api_key"]
+            .iter()
+            .any(|s| k.contains(s))
+        || k == "pwd"
+}
+
+/// Masks connection secrets anywhere in a reply:
+/// - the value of any field named like a secret (`password`, `sshPassphrase`, …);
+/// - in every string, the known secret values (`known_secrets`), the password part of
+///   URLs (`postgres://u:•••@h`) and `password=…` / `PASSWORD '…'` / `IDENTIFIED BY '…'`.
+///
+/// `rows` (query and page results) are the database's own data and are left as they
+/// are: masking every occurrence of a short password there would damage real values.
+pub fn redact(v: &Json, known: &[String]) -> Json {
+    match v {
+        Json::String(s) => Json::String(redact_text(s, known)),
+        Json::Array(items) => Json::Array(items.iter().map(|x| redact(x, known)).collect()),
+        Json::Object(m) => Json::Object(
+            m.iter()
+                .map(|(k, x)| {
+                    let x = if is_secret_key(k) && !x.is_null() && x != "" {
+                        Json::String(MASK.into())
+                    } else if k == "rows" || k == "documents" {
+                        x.clone()
+                    } else {
+                        redact(x, known)
+                    };
+                    (k.clone(), x)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// [`redact`] for one piece of text.
+pub fn redact_text(s: &str, known: &[String]) -> String {
+    let mut out = s.to_string();
+    for secret in known {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), MASK);
+        }
+    }
+    mask_url_passwords(&mask_assignments(&out))
+}
+
+/// `scheme://user:password@host` → `scheme://user:••••••@host`.
+fn mask_url_passwords(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        // The authority ends at the first `/`, whitespace or quote.
+        let end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'' || c == '?')
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                let userinfo = &authority[..at];
+                match userinfo.find(':') {
+                    Some(colon) => {
+                        out.push_str(&userinfo[..=colon]);
+                        out.push_str(MASK);
+                    }
+                    None => out.push_str(userinfo),
+                }
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Masks the value after `password=`, `pwd:`, `"password": "…"`, and the quoted value
+/// after SQL's `PASSWORD '…'` and `IDENTIFIED BY '…'`.
+fn mask_assignments(s: &str) -> String {
+    const WORDS: [&str; 5] = ["identified by", "passphrase", "password", "passwd", "pwd"];
+    let lower = s.to_ascii_lowercase();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    'scan: while i < s.len() {
+        for w in WORDS {
+            if !lower[i..].starts_with(w) {
+                continue;
+            }
+            // A whole word: not the middle of `mypasswords_table`.
+            let before_ok = i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric();
+            if !before_ok {
+                break;
+            }
+            let mut j = i + w.len();
+            // `"password": "…"` in JSON-looking text: skip the key's closing quote.
+            if j < s.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                j += 1;
+            }
+            let ws = |j: &mut usize| {
+                while *j < s.len() && (bytes[*j] == b' ' || bytes[*j] == b'\t') {
+                    *j += 1;
+                }
+            };
+            ws(&mut j);
+            let assign = j < s.len() && (bytes[j] == b'=' || bytes[j] == b':');
+            if assign {
+                j += 1;
+                ws(&mut j);
+            }
+            let quoted = j < s.len() && (bytes[j] == b'\'' || bytes[j] == b'"');
+            // Prose like "password missing" has neither `=` / `:` nor a quote.
+            if !assign && !quoted {
+                break;
+            }
+            let (value_start, value_end) = if quoted {
+                let q = bytes[j];
+                let end = s[j + 1..]
+                    .find(q as char)
+                    .map_or(s.len(), |e| j + 1 + e);
+                (j + 1, end)
+            } else {
+                let end = s[j..]
+                    .find(|c: char| c.is_whitespace() || ";&,)\"'".contains(c))
+                    .map_or(s.len(), |e| j + e);
+                (j, end)
+            };
+            if value_end > value_start {
+                out.push_str(&s[i..value_start]);
+                out.push_str(MASK);
+                i = value_end;
+                continue 'scan;
+            }
+            break;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn rpc_error(id: Json, code: i64, message: &str) -> Json {
@@ -758,6 +966,105 @@ mod tests {
         assert_eq!(v["rows"].as_array().unwrap().len(), 2);
         assert_eq!(v["truncated"], true);
         assert_eq!(v["rowCount"], 5);
+    }
+
+    #[test]
+    fn secrets_never_leave() {
+        let known = vec!["hunter22".to_string()];
+        let v = redact(
+            &json!({
+                "params": { "password": "hunter22", "sshPassphrase": "x", "host": "db" },
+                "error": "cannot reach postgres://app:hunter22@db:5432/shop",
+                "sql": "ALTER USER app PASSWORD 'n3w-pw'; CREATE USER b IDENTIFIED BY \"q\"",
+                "url": "mysql://root:abc@localhost/app and host=x password=xyz;port=1",
+                "rows": [["hunter22"]],
+                "note": "password missing"
+            }),
+            &known,
+        );
+        let text = v.to_string();
+        for leak in ["hunter22\"}", ":hunter22@", "n3w-pw", "abc@", "xyz", "\"x\""] {
+            assert!(!text.contains(leak), "{leak} leaked: {text}");
+        }
+        assert_eq!(v["params"]["password"], MASK);
+        assert_eq!(v["params"]["host"], "db");
+        assert_eq!(v["note"], "password missing");
+        assert!(v["error"].as_str().unwrap().contains("postgres://app:••••••@db:5432/shop"));
+        // Query rows are the database's data and stay as they are.
+        assert_eq!(v["rows"][0][0], "hunter22");
+    }
+
+    /// Never connects; enough to save connections.
+    struct NullDriver;
+    impl crate::driver::Driver for NullDriver {
+        fn info(&self) -> crate::driver::DriverInfo {
+            crate::driver::DriverInfo {
+                id: "null".into(),
+                name: "Null".into(),
+                params: Vec::new(),
+            }
+        }
+        fn dialect(&self) -> crate::dialect::Dialect {
+            crate::dialect::Dialect::for_driver("sqlite")
+        }
+        fn connect(
+            &self,
+            c: &ConnectionConfig,
+        ) -> Result<Box<dyn crate::driver::Session>> {
+            // A driver error that quotes the password, the worst case.
+            Err(Error::Database(format!(
+                "login failed for {}",
+                c.param("password").unwrap_or_default()
+            )))
+        }
+    }
+
+    #[test]
+    fn saved_passwords_do_not_reach_the_agent() {
+        let engine = Engine::new(Store::in_memory())
+            .with_secrets(Arc::new(crate::secrets::MemorySecrets::default()));
+        engine.register_driver(Arc::new(NullDriver));
+        let s = McpServer::new(Arc::new(engine));
+        let saved = s
+            .engine
+            .save_connection(ConnectionConfig {
+                name: "prod".into(),
+                driver: "null".into(),
+                params: [("password".to_string(), "s3cr3t-pw".to_string())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // A second one whose password is only in the keychain (as after a restart).
+        let secrets = Arc::new(crate::secrets::MemorySecrets::default());
+        let engine2 = Engine::new(Store::in_memory()).with_secrets(secrets.clone());
+        engine2.register_driver(Arc::new(NullDriver));
+        let kc = engine2
+            .save_connection(ConnectionConfig {
+                name: "kc".into(),
+                driver: "null".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        use crate::secrets::SecretStore as _;
+        secrets.set(&kc.id, "password", "k3ychain-only").unwrap();
+        let s2 = McpServer::new(Arc::new(engine2));
+        let r = call(&s2, 8, "tools/call", json!({ "name": "query", "arguments": { "connection": "kc", "sql": "select 1" } }));
+        assert!(r.to_string().contains("login failed"), "{r}");
+        assert!(!r.to_string().contains("k3ychain-only"), "keychain secret leaked: {r}");
+        // The store really holds it in memory: what the redaction has to catch.
+        assert!(serde_json::to_string(&s.engine.connections()).unwrap().contains("s3cr3t-pw"));
+        let attempts = [
+            ("run_command", json!({ "command": "connection.list" })),
+            ("run_command", json!({ "command": "connection.parseUrl", "params": { "url": "postgres://u:s3cr3t-pw@h/d" } })),
+            ("run_command", json!({ "command": "connection.save", "params": { "id": saved.id, "name": "prod", "driver": "null", "params": { "password": "s3cr3t-pw" } } })),
+            ("list_connections", json!({})),
+            ("query", json!({ "connection": "prod", "sql": "select 1" })),
+            ("query", json!({ "connection": "postgres://u:s3cr3t-pw@h/d", "sql": "select 1" })),
+        ];
+        for (tool, args) in attempts {
+            let r = call(&s, 9, "tools/call", json!({ "name": tool, "arguments": args }));
+            assert!(!r.to_string().contains("s3cr3t-pw"), "{tool} leaked: {r}");
+        }
     }
 
     #[test]
