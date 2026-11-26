@@ -190,4 +190,30 @@ in dark mode), a deliberate choice of our own. Text on the dark-mode teal is nea
   *Publish*); counts beside them in muted mono. Teal only on *Publish*.
 - Waiting says so in words: `Scanning keys…`, `Loading 100 rows…`, `Waiting for
   messages…`, `Publishing…`.
+- Key types are 18px outlined badges, 4px corners, the type's hue on the text and at 40%
+  on the border: string cyan, hash blue, list green, set yellow, zset magenta, stream red
+  (the theme's base hues). A TTL badge is muted, or `warning` when the key expires. Type
+  is the one place colour names a category rather than a state, because telling types
+  apart at a glance is the point of the list.
+- The item dialog is 760px wide: the title is the index / field / member in mono with
+  muted badges (encoding, size, score); a *View* row with an outlined `ButtonGroup`
+  (Text, JSON, Hex, Base64; JSON disabled when the value is not JSON) and *Word wrap*
+  on the right; the value in a 380px mono well (foreground at 3%, hairline, 6px
+  corners); *Copy* and a primary *Edit* at the bottom, which become *Cancel* and
+  *Save*. Rename is a 440px dialog with one labelled field. Above *View* sits a
+  *Decode* row (same `ButtonGroup`, labels 44px wide so both rows line up); a decode
+  error shows in `danger` under them. *Set expiry* is a 440px dialog: one labelled
+  field, the current state in muted text, *Remove expiry* on the left of the footer.
+- The key pane has two tabs at the top, *Key* (`key-round`) and *Command line*
+  (`square-terminal`), as small ghost buttons with the selected one lifted. The command
+  line is a mono log (`›` in teal, the command, its time on the right, the reply muted
+  and indented, errors in `danger`) over an input with *Run* and a clear button.
+- Key folders: chevron, folder icon, name in mono, count in muted mono; 16px indent per
+  level; keys under a folder start past its chevron.
+- Choices of two or three (QoS, All / Received / Sent) are the kit's outlined
+  `ButtonGroup`, not loose ghost buttons.
+- Form fields in panels have a 12px muted label above them (*Topic*, *Payload*); the
+  payload editor has no gutter and wraps.
+- The console's picked message opens a 360px panel on the right instead of a strip under
+  the list; the publish panel opens from the toolbar and folds away with its chevron.
 

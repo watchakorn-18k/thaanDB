@@ -7,6 +7,7 @@ pub mod browse;
 pub mod cmdline;
 pub mod commands;
 pub mod connection;
+pub mod decode;
 pub mod dialect;
 pub mod doc;
 pub mod driver;

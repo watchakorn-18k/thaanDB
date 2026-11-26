@@ -20,7 +20,7 @@ redis = ["dep:thaan-driver-redis"]
 mqtt = ["dep:thaan-driver-mqtt"]
 
 [dependencies]
-thaan-core.workspace = true
+thaan-core = { workspace = true, features = ["decoders"] }
 thaan-driver-sqlite = { workspace = true, optional = true }
 thaan-driver-postgres = { workspace = true, optional = true }
 thaan-driver-mysql = { workspace = true, optional = true }

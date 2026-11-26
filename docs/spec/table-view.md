@@ -123,9 +123,18 @@ loads all the rest, and an *Export* menu.
 
 ## T6. Redis key browser
 
-**Status: built** (`key_browser.rs`, `keys.scan`). Not yet: the value search mode, the
-*no expiry* toggle, group by `:`, *Add key*, editing values in place, and the Console /
-Pub/Sub / Slow log tabs (the query tab on that database is the console for now).
+**Status: built** (`key_browser.rs`, `keys.scan`), reworked on 2026-11-26 from two more
+screenshots the maintainer shared of the other client (key tree with folders and badges;
+a list key's detail with an add row). Built: folders by `:` with counts, type and TTL
+badges (our theme's base hues, our own pairing), checkboxes, *Select all*, bulk delete,
+*Fuzzy*, *No expiry*, `+` *Add key*, `N / M keys loaded`, and on the right the key header
+with badges, an item search and an add row. A third round of screenshots (the key header's
+actions, a rename dialog, an item viewer with decode and view choices and Edit / Copy)
+added *Rename key* and the item dialog: View as Text / JSON / Hex / Base64, word wrap,
+Copy, Edit and Save. Then the decoders (GZip, Zlib, Deflate, Base64,
+MessagePack, Pickle, Protobuf without a schema), *Set expiry* from the header, and a
+*Command line* tab. Not yet: searching values, custom grouping rules, PHP and Java
+serialised decoders, plug-in decoders, and the Pub/Sub and Slow log tabs.
 
 **Observed:** a Redis database opens as one tab split in two panes.
 - Left pane: a switch for what the search box matches (key name, value, or both), the key
@@ -164,7 +173,8 @@ All / Received / Sent switch, a payload search, a payload format picker, Pause, 
 expand / collapse of payloads; under them a publish panel: topic, QoS 0/1/2, retain,
 payload encoding, payload, and a publish button (Ctrl+Enter).
 
-**Built** (`broker_console.rs`):
+**Built** (`broker_console.rs`; reworked on 2026-11-26 after the maintainer asked for an
+easier console):
 - The tree shows one *Console* row under an MQTT connection (no databases, no folders).
 - Left: *Subscriptions* with a count, each row a filter in mono, its granted QoS and an
   unsubscribe `x`; at the bottom a filter box, QoS 0 / QoS 1, *Subscribe* (Enter works).
