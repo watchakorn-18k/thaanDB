@@ -5,7 +5,10 @@ use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_family = "wasm"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_family = "wasm")]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Parameter keys never written to disk.
 pub const SECRET_KEYS: &[&str] = &["password", "sshPassword", "sshPassphrase"];

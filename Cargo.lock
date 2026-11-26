@@ -7695,6 +7695,7 @@ dependencies = [
  "serde-pickle",
  "serde_json",
  "thiserror 2.0.21",
+ "web-time",
 ]
 
 [[package]]
@@ -7754,6 +7755,20 @@ version = "0.1.0"
 dependencies = [
  "keyring",
  "thaan-core",
+]
+
+[[package]]
+name = "thaan-web"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
+ "js-sys",
+ "serde_json",
+ "thaan-core",
+ "thaan-driver-mqtt",
+ "thaan-driver-sqlite",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

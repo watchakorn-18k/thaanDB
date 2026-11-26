@@ -1,0 +1,23 @@
+[package]
+name = "thaan-web"
+description = "ThaanDB in the browser (WebAssembly): a demo of the desktop app for GitHub Pages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Everything is wasm-only: on other targets this crate is empty, so workspace builds,
+# tests and clippy on the desktop are unaffected.
+[target.'cfg(target_family = "wasm")'.dependencies]
+thaan-core.workspace = true
+thaan-driver-sqlite.workspace = true
+# Only its `packet` module (MQTT wire format); the browser carries it over WebSocket.
+thaan-driver-mqtt.workspace = true
+gpui-kit = { version = "0.11.0" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde_json.workspace = true
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event"] }

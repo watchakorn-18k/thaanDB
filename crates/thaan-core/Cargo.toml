@@ -12,6 +12,10 @@ thiserror.workspace = true
 flate2 = { version = "1.1", optional = true }
 serde-pickle = { version = "1.2", optional = true }
 
+# std::time panics in browser wasm; web-time is the same API on the browser clock.
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1.1"
+
 [features]
 # Value decoders for the key browser's item view (gzip / zlib / deflate, pickle).
 decoders = ["dep:flate2", "dep:serde-pickle"]
