@@ -1,6 +1,8 @@
 //! Main window. All work is dispatched to `thaan_core::Engine`; this file only holds view
 //! state and layout (see AGENTS.md, principle 1 and 3).
 
+#[path = "app_link.rs"]
+mod app_link;
 #[path = "cell_edit.rs"]
 mod cell_edit;
 #[path = "command_bar.rs"]
@@ -313,6 +315,8 @@ pub struct ThaanApp {
     op_dialog: Option<table_ops::OpDialog>,
     /// App preferences (Settings dialog); saved through `Engine::set_settings`.
     settings: thaan_core::store::Settings,
+    /// What `thaan mcp` asked to show once this saved connection is connected.
+    link_after_connect: Option<(String, app_link::LinkAction)>,
     /// Settings dialog page and its MCP lookup.
     settings_ui: settings::SettingsUi,
     /// The past query that tab starts with (Recent queries on home), if any.
@@ -412,6 +416,7 @@ impl ThaanApp {
         let mut app = Self {
             settings,
             settings_ui: Default::default(),
+            link_after_connect: None,
             engine,
             focus: cx.focus_handle(),
             drivers,
@@ -448,6 +453,8 @@ impl ThaanApp {
             home,
         };
         app.refresh_home_history();
+        // `thaan mcp` can open tables and show queries here (app_link.rs).
+        app.start_app_link(window, cx);
         app
     }
 
@@ -637,6 +644,7 @@ impl ThaanApp {
                         // and the main area stays as it is. Only "Open" (right-click)
                         // also opens a query tab for it.
                         let sid = info.session_id;
+                        let info_connection_id = info.connection_id.clone();
                         let open = this.open_after_connect.take().as_deref()
                             == Some(info.connection_id.as_str());
                         this.adopt(info, objects);
@@ -652,9 +660,17 @@ impl ThaanApp {
                                 }
                             }
                         }
+                        // An agent asked (through `thaan mcp`) to show something here.
+                        if let Some((cid, action)) = this.link_after_connect.take() {
+                            if cid == info_connection_id {
+                                this.activate(sid, cx);
+                                this.run_link_action(action, &cid, window, cx);
+                            }
+                        }
                         this.set_status("Connected", false, cx);
                     }
                     Err(e) => {
+                        this.link_after_connect = None;
                         this.open_after_connect = None;
                         this.open_query_after_connect = None;
                         this.set_status(format!("Connection failed: {e}"), true, cx)

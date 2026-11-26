@@ -87,6 +87,14 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             true
         ),
         cmd!(
+            "connection.duplicate",
+            "Duplicate connection",
+            "Connection",
+            "{id, name?} (secrets are copied too)",
+            None,
+            true
+        ),
+        cmd!(
             "connection.listFolders",
             "List connection groups",
             "Connection",
@@ -251,6 +259,14 @@ pub fn builtin_commands() -> Vec<CommandSpec> {
             "Describe table",
             "Schema",
             "{sessionId, table}",
+            None,
+            false
+        ),
+        cmd!(
+            "schema.context",
+            "Schema overview",
+            "Schema",
+            "{sessionId, database?, tables?: [name], limit?} (every table's columns and keys, default 200 tables)",
             None,
             false
         ),
@@ -563,6 +579,11 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
             e.delete_connection(&p::<String>(&params["id"])?)?;
             json!({ "ok": true })
         }
+        "connection.duplicate" => {
+            let id: String = p(&params["id"])?;
+            let name: Option<String> = p(&params["name"]).unwrap_or(None);
+            serde_json::to_value(e.duplicate_connection(&id, name.as_deref())?)?
+        }
         "connection.listFolders" => serde_json::to_value(e.folders())?,
         "connection.createFolder" => {
             serde_json::to_value(e.create_folder(&p::<String>(&params["name"])?)?)?
@@ -659,6 +680,17 @@ pub fn dispatch(e: &Engine, id: &str, params: &Json) -> Result<Json> {
         "schema.describeTable" => {
             let a: TableArgs = p(params)?;
             serde_json::to_value(e.describe_table(a.session_id, &a.table)?)?
+        }
+        "schema.context" => {
+            let sid = p::<Sid>(params)?.session_id;
+            let only: Vec<String> = p(&params["tables"]).unwrap_or_default();
+            let limit = params["limit"].as_u64().unwrap_or(200).clamp(1, 2000) as usize;
+            serde_json::to_value(e.schema_context(
+                sid,
+                params["database"].as_str(),
+                &only,
+                limit,
+            )?)?
         }
         "structure.ddl" => {
             let a: TableArgs = p(params)?;

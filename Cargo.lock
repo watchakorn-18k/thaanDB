@@ -7656,6 +7656,7 @@ name = "thaan-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "gpui-kit",
  "serde_json",

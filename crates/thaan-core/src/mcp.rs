@@ -42,8 +42,13 @@ postgres://user:pw@host/db; it opens on first use and stays open. `query` runs S
 list_commands for anything else (structure changes, staged edits, transfers, export, saved \
 queries, history, settings).";
 
+/// Sends one request to the running desktop app and returns its answer. The transport
+/// (a local socket) lives in the client binary; this crate does no network I/O.
+pub type AppLink = Arc<dyn Fn(&Json) -> Result<Json> + Send + Sync>;
+
 pub struct McpServer {
     engine: Arc<Engine>,
+    app: Option<AppLink>,
     /// `connection` argument as given → open session.
     sessions: Mutex<HashMap<String, SessionId>>,
 }
@@ -52,8 +57,37 @@ impl McpServer {
     pub fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
+            app: None,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Lets `open_table` and `execute_and_show` reach the desktop app.
+    pub fn with_app_link(mut self, link: AppLink) -> Self {
+        self.app = Some(link);
+        self
+    }
+
+    fn app(&self, request: Json) -> Result<Json> {
+        let link = self
+            .app
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("no link to the ThaanDB app".into()))?;
+        link(&request)
+    }
+
+    /// The saved connection a show-in-app tool names (the app only knows saved ones).
+    fn saved_for_app(&self, a: &Json) -> Result<ConnectionConfig> {
+        let key = conn_key(a)?;
+        self.engine
+            .connections()
+            .into_iter()
+            .find(|c| c.id == key || c.name.eq_ignore_ascii_case(&key))
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "`{key}` is not a saved connection; the app shows saved ones only (add_connection first)"
+                ))
+            })
     }
 
     pub fn engine(&self) -> &Engine {
@@ -294,6 +328,93 @@ impl McpServer {
                 v["pageCount"] = page.page_count().into();
                 Ok(v)
             }
+            "get_schema_context" => {
+                let sid = self.session(a)?;
+                let only: Vec<String> = match &a["tables"] {
+                    Json::Array(t) => t
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    _ => vec![],
+                };
+                let limit = a["limit"].as_u64().unwrap_or(200).clamp(1, 2000) as usize;
+                let ctx = e.schema_context(sid, str_arg(a, "database"), &only, limit)?;
+                Ok(schema_context_json(&ctx))
+            }
+            "list_routines" => {
+                let sid = self.session(a)?;
+                let objs = match str_arg(a, "database") {
+                    Some(db) => e.list_objects_in(sid, db)?,
+                    None => e.list_objects(sid)?,
+                };
+                let routines: Vec<Json> = objs
+                    .into_iter()
+                    .filter(|o| o.kind == crate::schema::ObjectKind::Routine)
+                    .filter(|o| match str_arg(a, "schema") {
+                        Some(s) => o.object.schema.as_deref() == Some(s),
+                        None => true,
+                    })
+                    .map(|o| json!({ "name": o.object.name, "schema": o.object.schema }))
+                    .collect();
+                Ok(json!({ "routines": routines }))
+            }
+            "get_routine_source" => {
+                let sid = self.session(a)?;
+                let mut args = a.clone();
+                if args.get("table").is_none() {
+                    args["table"] = a["name"].clone();
+                }
+                let r = table_ref(&args)?;
+                Ok(json!({ "name": r.name, "schema": r.schema, "source": e.ddl(sid, &r)? }))
+            }
+            "duplicate_connection" => {
+                let key = conn_key(a)?;
+                let original = e
+                    .connections()
+                    .into_iter()
+                    .find(|c| c.id == key || c.name.eq_ignore_ascii_case(&key))
+                    .ok_or_else(|| Error::UnknownConnection(key.clone()))?;
+                let copy = e.duplicate_connection(&original.id, str_arg(a, "name"))?;
+                Ok(json!({ "id": copy.id, "name": copy.name, "driver": copy.driver }))
+            }
+            "open_table" => {
+                let c = self.saved_for_app(a)?;
+                let t = table_ref(a)?;
+                self.app(json!({
+                    "action": "openTable",
+                    "connection": c.id,
+                    "table": t.name,
+                    "schema": t.schema,
+                }))
+            }
+            "execute_and_show" => {
+                let c = self.saved_for_app(a)?;
+                let sql = str_arg(a, "sql")
+                    .ok_or_else(|| Error::InvalidParams("`sql` is required".into()))?;
+                // Reads also run here so the agent gets the rows; anything that may write
+                // runs only in the app, never twice. Non-SQL languages count as writes.
+                let sid = self.session(&json!({ "connection": c.id }))?;
+                let open = e.session(sid)?;
+                let reads_only = open.dialect.language == crate::dialect::QueryLanguage::Sql
+                    && e.split(sid, sql)?
+                        .iter()
+                        .all(|st| crate::engine::is_read_statement(&st.sql));
+                let shown =
+                    self.app(json!({ "action": "show", "connection": c.id, "sql": sql }))?;
+                let mut out = json!({ "shown": shown });
+                if reads_only {
+                    out["results"] = self.call(
+                        "query",
+                        &json!({ "connection": c.id, "sql": sql, "maxRows": a["maxRows"] }),
+                    )?["results"]
+                        .clone();
+                } else {
+                    out["note"] =
+                        "may write, so it ran only in the app; its results are on screen there"
+                            .into();
+                }
+                Ok(out)
+            }
             "disconnect" => {
                 let key = conn_key(a)?;
                 let sid = self.lock_sessions().remove(&key);
@@ -434,9 +555,17 @@ fn is_secret_key(k: &str) -> bool {
     crate::store::SECRET_KEYS
         .iter()
         .any(|s| s.eq_ignore_ascii_case(&k))
-        || ["password", "passwd", "passphrase", "secret", "token", "apikey", "api_key"]
-            .iter()
-            .any(|s| k.contains(s))
+        || [
+            "password",
+            "passwd",
+            "passphrase",
+            "secret",
+            "token",
+            "apikey",
+            "api_key",
+        ]
+        .iter()
+        .any(|s| k.contains(s))
         || k == "pwd"
 }
 
@@ -553,9 +682,7 @@ fn mask_assignments(s: &str) -> String {
             }
             let (value_start, value_end) = if quoted {
                 let q = bytes[j];
-                let end = s[j + 1..]
-                    .find(q as char)
-                    .map_or(s.len(), |e| j + 1 + e);
+                let end = s[j + 1..].find(q as char).map_or(s.len(), |e| j + 1 + e);
                 (j + 1, end)
             } else {
                 let end = s[j..]
@@ -704,6 +831,92 @@ fn result_json(rs: &ResultSet, max: usize) -> Json {
     v
 }
 
+/// A compact schema for an agent's context: one string per column
+/// (`id integer PK`, `org_id integer NOT NULL → orgs.id`).
+fn schema_context_json(ctx: &crate::engine::SchemaContext) -> Json {
+    let tables: Vec<Json> = ctx
+        .tables
+        .iter()
+        .map(|t| {
+            let i = &t.info;
+            let columns: Vec<String> = i
+                .columns
+                .iter()
+                .map(|c| {
+                    let mut s = format!("{} {}", c.name, c.data_type);
+                    if c.primary_key.is_some() {
+                        s.push_str(" PK");
+                    } else if !c.nullable {
+                        s.push_str(" NOT NULL");
+                    }
+                    if c.auto_increment {
+                        s.push_str(" AUTO");
+                    }
+                    if let Some(d) = c.default.as_deref().filter(|d| !d.is_empty()) {
+                        s.push_str(&format!(" DEFAULT {d}"));
+                    }
+                    if let Some(fk) = i
+                        .foreign_keys
+                        .iter()
+                        .find(|f| f.columns == [c.name.clone()])
+                    {
+                        let target = match &fk.ref_schema {
+                            Some(sc) => format!("{sc}.{}", fk.ref_table),
+                            None => fk.ref_table.clone(),
+                        };
+                        s.push_str(&format!(" → {target}.{}", fk.ref_columns.join(", ")));
+                    }
+                    if let Some(cm) = c.comment.as_deref().filter(|x| !x.is_empty()) {
+                        s.push_str(&format!(" -- {cm}"));
+                    }
+                    s
+                })
+                .collect();
+            let mut v = json!({ "name": i.object.name, "kind": t.kind, "columns": columns });
+            if let Some(s) = &i.object.schema {
+                v["schema"] = s.clone().into();
+            }
+            // Keys over several columns do not fit on one column line.
+            let multi: Vec<String> = i
+                .foreign_keys
+                .iter()
+                .filter(|f| f.columns.len() > 1)
+                .map(|f| {
+                    format!(
+                        "({}) → {}({})",
+                        f.columns.join(", "),
+                        f.ref_table,
+                        f.ref_columns.join(", ")
+                    )
+                })
+                .collect();
+            if !multi.is_empty() {
+                v["foreignKeys"] = multi.into();
+            }
+            if let Some(err) = &t.error {
+                v["error"] = err.clone().into();
+            }
+            v
+        })
+        .collect();
+    let mut v = json!({ "database": ctx.database, "tables": tables });
+    if !ctx.routines.is_empty() {
+        v["routines"] = ctx
+            .routines
+            .iter()
+            .map(|r| match &r.schema {
+                Some(s) => format!("{s}.{}", r.name),
+                None => r.name.clone(),
+            })
+            .collect();
+    }
+    if ctx.truncated {
+        v["truncated"] = true.into();
+        v["note"] = "more tables than the limit; raise limit or pass tables".into();
+    }
+    v
+}
+
 /// Where a saved connection points, without secrets.
 fn target(c: &ConnectionConfig) -> String {
     let p = |k: &str| c.param(k).unwrap_or_default();
@@ -841,6 +1054,96 @@ pub fn tools() -> Vec<Json> {
                 "required": ["connection", "table"]
             },
             "annotations": read,
+        }),
+        json!({
+            "name": "get_schema_context",
+            "title": "Schema overview",
+            "description": "Every table and view with its columns (type, PK, NOT NULL, default, foreign key target) in one call, plus the names of functions and procedures. Use it first to learn a database before writing queries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": conn_prop(),
+                    "database": { "type": "string", "description": "Another database on the same server" },
+                    "tables": { "type": "array", "items": { "type": "string" }, "description": "Only these tables (name or schema.name)" },
+                    "limit": { "type": "integer", "description": "Most tables to describe (default 200)" }
+                },
+                "required": ["connection"]
+            },
+            "annotations": read,
+        }),
+        json!({
+            "name": "list_routines",
+            "title": "List routines",
+            "description": "Stored functions and procedures (PostgreSQL, MySQL/MariaDB; SQLite has none).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": conn_prop(),
+                    "database": { "type": "string", "description": "Another database on the same server" },
+                    "schema": { "type": "string", "description": "Only routines in this schema" }
+                },
+                "required": ["connection"]
+            },
+            "annotations": read,
+        }),
+        json!({
+            "name": "get_routine_source",
+            "title": "Routine source",
+            "description": "The CREATE FUNCTION / CREATE PROCEDURE statement of a routine.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": conn_prop(),
+                    "name": { "type": "string", "description": "Routine name (`schema.name` works too)" },
+                    "schema": { "type": "string", "description": "Schema, when not in `name`" }
+                },
+                "required": ["connection", "name"]
+            },
+            "annotations": read,
+        }),
+        json!({
+            "name": "duplicate_connection",
+            "title": "Duplicate connection",
+            "description": "Save a copy of a saved connection (password included, never shown), placed below the original. Handy before pointing the copy at another database.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": { "type": "string", "description": "Saved connection name or id" },
+                    "name": { "type": "string", "description": "Name of the copy (default: `<name> copy`)" }
+                },
+                "required": ["connection"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false },
+        }),
+        json!({
+            "name": "open_table",
+            "title": "Open table in ThaanDB",
+            "description": "Open a table or collection in the ThaanDB window for the user to see (connects first if needed). Needs the app running and a saved connection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": { "type": "string", "description": "Saved connection name or id" },
+                    "table": table.clone(),
+                    "schema": schema.clone()
+                },
+                "required": ["connection", "table"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "execute_and_show",
+            "title": "Run and show in ThaanDB",
+            "description": "Run statements in a new query tab of the ThaanDB window so the user sees the results there. Read-only SQL also returns the rows to you; anything that may write runs once, in the app only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection": { "type": "string", "description": "Saved connection name or id" },
+                    "sql": { "type": "string", "description": "Statements to run" },
+                    "maxRows": { "type": "integer", "description": "Rows returned to you per statement (default 200)" }
+                },
+                "required": ["connection", "sql"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true },
         }),
         json!({
             "name": "disconnect",
@@ -983,13 +1286,23 @@ mod tests {
             &known,
         );
         let text = v.to_string();
-        for leak in ["hunter22\"}", ":hunter22@", "n3w-pw", "abc@", "xyz", "\"x\""] {
+        for leak in [
+            "hunter22\"}",
+            ":hunter22@",
+            "n3w-pw",
+            "abc@",
+            "xyz",
+            "\"x\"",
+        ] {
             assert!(!text.contains(leak), "{leak} leaked: {text}");
         }
         assert_eq!(v["params"]["password"], MASK);
         assert_eq!(v["params"]["host"], "db");
         assert_eq!(v["note"], "password missing");
-        assert!(v["error"].as_str().unwrap().contains("postgres://app:••••••@db:5432/shop"));
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("postgres://app:••••••@db:5432/shop"));
         // Query rows are the database's data and stay as they are.
         assert_eq!(v["rows"][0][0], "hunter22");
     }
@@ -1007,10 +1320,7 @@ mod tests {
         fn dialect(&self) -> crate::dialect::Dialect {
             crate::dialect::Dialect::for_driver("sqlite")
         }
-        fn connect(
-            &self,
-            c: &ConnectionConfig,
-        ) -> Result<Box<dyn crate::driver::Session>> {
+        fn connect(&self, c: &ConnectionConfig) -> Result<Box<dyn crate::driver::Session>> {
             // A driver error that quotes the password, the worst case.
             Err(Error::Database(format!(
                 "login failed for {}",
@@ -1048,21 +1358,45 @@ mod tests {
         use crate::secrets::SecretStore as _;
         secrets.set(&kc.id, "password", "k3ychain-only").unwrap();
         let s2 = McpServer::new(Arc::new(engine2));
-        let r = call(&s2, 8, "tools/call", json!({ "name": "query", "arguments": { "connection": "kc", "sql": "select 1" } }));
+        let r = call(
+            &s2,
+            8,
+            "tools/call",
+            json!({ "name": "query", "arguments": { "connection": "kc", "sql": "select 1" } }),
+        );
         assert!(r.to_string().contains("login failed"), "{r}");
-        assert!(!r.to_string().contains("k3ychain-only"), "keychain secret leaked: {r}");
+        assert!(
+            !r.to_string().contains("k3ychain-only"),
+            "keychain secret leaked: {r}"
+        );
         // The store really holds it in memory: what the redaction has to catch.
-        assert!(serde_json::to_string(&s.engine.connections()).unwrap().contains("s3cr3t-pw"));
+        assert!(serde_json::to_string(&s.engine.connections())
+            .unwrap()
+            .contains("s3cr3t-pw"));
         let attempts = [
             ("run_command", json!({ "command": "connection.list" })),
-            ("run_command", json!({ "command": "connection.parseUrl", "params": { "url": "postgres://u:s3cr3t-pw@h/d" } })),
-            ("run_command", json!({ "command": "connection.save", "params": { "id": saved.id, "name": "prod", "driver": "null", "params": { "password": "s3cr3t-pw" } } })),
+            (
+                "run_command",
+                json!({ "command": "connection.parseUrl", "params": { "url": "postgres://u:s3cr3t-pw@h/d" } }),
+            ),
+            (
+                "run_command",
+                json!({ "command": "connection.save", "params": { "id": saved.id, "name": "prod", "driver": "null", "params": { "password": "s3cr3t-pw" } } }),
+            ),
             ("list_connections", json!({})),
             ("query", json!({ "connection": "prod", "sql": "select 1" })),
-            ("query", json!({ "connection": "postgres://u:s3cr3t-pw@h/d", "sql": "select 1" })),
+            (
+                "query",
+                json!({ "connection": "postgres://u:s3cr3t-pw@h/d", "sql": "select 1" }),
+            ),
         ];
         for (tool, args) in attempts {
-            let r = call(&s, 9, "tools/call", json!({ "name": tool, "arguments": args }));
+            let r = call(
+                &s,
+                9,
+                "tools/call",
+                json!({ "name": tool, "arguments": args }),
+            );
             assert!(!r.to_string().contains("s3cr3t-pw"), "{tool} leaked: {r}");
         }
     }

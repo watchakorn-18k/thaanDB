@@ -34,14 +34,46 @@ session id to pass around.
 | --- | --- |
 | `list_connections` | Saved connections and open sessions |
 | `add_connection` | Save a connection from a URL (or a full config); tested first |
+| `duplicate_connection` | Save a copy of a saved connection, password included (never shown) |
 | `query` | Run statements: SQL, MongoDB shell syntax, Redis commands. `params` for placeholders, `maxRows` (default 200, max 5000) |
 | `list_databases` | Databases on the server |
 | `list_tables` | Tables, views, indexes, triggers / collections / keys |
+| `get_schema_context` | Every table's columns (type, PK, NOT NULL, default, FK target) and the routines' names, in one call |
 | `describe_table` | Columns, keys, indexes, triggers and the CREATE statement |
 | `fetch_rows` | One page of a table with total count; `where`, `sort` (`["-age"]`), `page`, `pageSize` |
+| `list_routines` | Stored functions and procedures (PostgreSQL, MySQL/MariaDB) |
+| `get_routine_source` | A routine's CREATE FUNCTION / PROCEDURE |
+| `open_table` | Open a table in the ThaanDB window (connects first if needed) |
+| `execute_and_show` | Run statements in a new query tab of the ThaanDB window; read-only SQL also returns the rows |
 | `disconnect` | Close a connection's session |
 | `list_commands` | Every engine command id and its parameters |
 | `run_command` | Run any command (structure changes, staged edits, rename / truncate / drop, data transfer, export, saved queries, history, settings); `connection` fills in `sessionId` |
+
+## Passwords
+
+An agent never sees a connection password. The server sends every reply and error
+through one redaction (`thaan_core::mcp::redact`) before it leaves:
+
+- fields named like a secret (`password`, `sshPassphrase`, `token`, …) read `••••••`;
+- in every string, the passwords this process holds (saved connections, open sessions)
+  are masked, and so are URL passwords (`postgres://u:••••••@h`) and `password=…`,
+  `PASSWORD '…'`, `IDENTIFIED BY '…'`;
+- when a connect fails, the passwords read from the keychain for it are masked in the
+  driver's message too.
+
+`run_command connection.list` is covered like everything else. Query rows are the
+database's own data and pass unchanged. Agents can still use saved passwords (connect,
+duplicate) without seeing them; the keychain entry stays where the app put it.
+
+## Showing things in the app
+
+`open_table` and `execute_and_show` need the desktop app running. At startup the app
+listens on 127.0.0.1 (a free port) and writes `app-link.json` next to the store
+(readable by your user only) with the port and a random token; `thaan mcp` sends one
+JSON line with that token per request. The app shows saved connections only, connects
+when needed and brings its window forward. `execute_and_show` runs anything that may
+write only in the app (never twice); read-only SQL also runs in the server so the agent
+gets the rows.
 
 ## Permissions
 

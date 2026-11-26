@@ -102,6 +102,26 @@ pub struct StatementResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SchemaContext {
+    pub database: Option<String>,
+    pub tables: Vec<TableContext>,
+    /// Functions and procedures (name only; `structure.ddl` gives the source).
+    pub routines: Vec<ObjectRef>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableContext {
+    pub kind: crate::schema::ObjectKind,
+    #[serde(flatten)]
+    pub info: TableInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TablePage {
     pub result: ResultSet,
     pub total_rows: u64,
@@ -302,6 +322,29 @@ impl Engine {
             }
         }
         Ok(c)
+    }
+
+    /// A copy of a saved connection, secrets included (read from the keychain, so the
+    /// copy can connect even when the original's password is not in memory), placed
+    /// right below the original. Named `<name> copy` unless `name` is given.
+    pub fn duplicate_connection(&self, id: &str, name: Option<&str>) -> Result<ConnectionConfig> {
+        let original = self.connection(id)?;
+        let mut copy = original.clone();
+        self.fill_secrets(&mut copy);
+        copy.id = String::new();
+        copy.name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => format!("{} copy", original.name),
+        };
+        let saved = self.save_connection(copy)?;
+        let conns = self.connections();
+        let next = conns
+            .iter()
+            .position(|x| x.id == original.id)
+            .and_then(|i| conns.get(i + 1))
+            .map(|x| x.id.clone())
+            .filter(|n| *n != saved.id);
+        self.place_connection(&saved.id, saved.folder.as_deref(), next.as_deref())
     }
 
     pub fn delete_connection(&self, id: &str) -> Result<()> {
@@ -809,6 +852,72 @@ impl Engine {
 
     pub fn describe_table(&self, id: SessionId, t: &ObjectRef) -> Result<TableInfo> {
         self.session(id)?.lock().describe_table(t)
+    }
+
+    /// Every table and view of the session's database (or `database`) with its columns
+    /// and foreign keys, in one call: what an agent or a SQL assistant needs to write
+    /// queries. `only` keeps the named tables; at most `limit` tables are described,
+    /// and `truncated` says when there were more.
+    pub fn schema_context(
+        &self,
+        id: SessionId,
+        database: Option<&str>,
+        only: &[String],
+        limit: usize,
+    ) -> Result<SchemaContext> {
+        use crate::schema::ObjectKind;
+        let objects = match database {
+            Some(db) => self.list_objects_in(id, db)?,
+            None => self.list_objects(id)?,
+        };
+        let wanted = |o: &SchemaObject| {
+            matches!(
+                o.kind,
+                ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView
+            ) && (only.is_empty()
+                || only.iter().any(|n| {
+                    n.eq_ignore_ascii_case(&o.object.name)
+                        || o.object.schema.as_ref().is_some_and(|s| {
+                            n.eq_ignore_ascii_case(&format!("{s}.{}", o.object.name))
+                        })
+                }))
+        };
+        let picked: Vec<&SchemaObject> = objects.iter().filter(|o| wanted(o)).collect();
+        let truncated = picked.len() > limit;
+        let routines = objects
+            .iter()
+            .filter(|o| o.kind == ObjectKind::Routine)
+            .map(|o| o.object.clone())
+            .collect();
+        let mut tables = Vec::new();
+        for o in picked.into_iter().take(limit) {
+            let kind = o.kind;
+            match self.describe_table(id, &o.object) {
+                Ok(info) => tables.push(TableContext {
+                    kind,
+                    info,
+                    error: None,
+                }),
+                // One table that cannot be read does not lose the others.
+                Err(e) => tables.push(TableContext {
+                    kind,
+                    info: TableInfo {
+                        object: o.object.clone(),
+                        columns: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        indexes: Vec::new(),
+                        triggers: Vec::new(),
+                    },
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        Ok(SchemaContext {
+            database: self.list_databases(id).ok().and_then(|d| d.current),
+            tables,
+            routines,
+            truncated,
+        })
     }
 
     pub fn ddl(&self, id: SessionId, t: &ObjectRef) -> Result<String> {

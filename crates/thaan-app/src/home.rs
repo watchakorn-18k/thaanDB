@@ -831,24 +831,13 @@ impl ThaanApp {
 
     /// Saves a copy of a connection, named "… copy", right after it in the same group.
     fn duplicate_connection(&mut self, c: ConnectionConfig, cx: &mut Context<Self>) {
-        let mut copy = c.clone();
-        copy.id = String::new();
-        copy.name = format!("{} copy", c.name);
         let engine = self.engine.clone();
-        let after = c.id.clone();
         cx.spawn(async move |this, cx| {
+            // The engine copies the password too (from the keychain) and places the copy
+            // right below the original.
             let res = cx
                 .background_spawn(async move {
-                    let saved = engine.save_connection(copy)?;
-                    // Put the copy right below the original.
-                    let conns = engine.connections();
-                    let next = conns
-                        .iter()
-                        .position(|x| x.id == after)
-                        .and_then(|i| conns.get(i + 1))
-                        .map(|x| x.id.clone())
-                        .filter(|n| *n != saved.id);
-                    engine.place_connection(&saved.id, saved.folder.as_deref(), next.as_deref())?;
+                    let saved = engine.duplicate_connection(&c.id, None)?;
                     Ok::<_, thaan_core::Error>((saved.name, engine.connections()))
                 })
                 .await;

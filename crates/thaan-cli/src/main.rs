@@ -205,7 +205,14 @@ fn real_main() -> Result<()> {
     }
     let e = engine(&args)?;
     match cmd {
-        "mcp" => return mcp::serve(Arc::new(e)),
+        "mcp" => {
+            let store = args
+                .flag("store")
+                .map(std::path::PathBuf::from)
+                .or_else(Store::default_path);
+            let dir = store.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            return mcp::serve(Arc::new(e), dir);
+        }
         "commands" => {
             for c in builtin_commands() {
                 let short = c.shortcut.map(|s| format!("  [{s}]")).unwrap_or_default();

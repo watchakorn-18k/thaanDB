@@ -122,6 +122,32 @@ fn stdio_session_against_sqlite() {
     assert_eq!(d["columns"].as_array().unwrap().len(), 3);
     assert!(d["ddl"].as_str().unwrap().contains("CREATE TABLE"));
 
+    let ctx = c.tool("get_schema_context", json!({ "connection": "shop" }));
+    assert_eq!(
+        ctx["tables"][0]["columns"],
+        json!(["id INTEGER PK", "name TEXT", "age INT"])
+    );
+
+    // A copy of a saved connection works by its new name.
+    let copy = c.tool(
+        "duplicate_connection",
+        json!({ "connection": "shop", "name": "shop 2" }),
+    );
+    assert_eq!(copy["name"], "shop 2");
+    let r = c.tool(
+        "query",
+        json!({ "connection": "shop 2", "sql": "select count(*) as n from users" }),
+    );
+    assert_eq!(r["results"][0]["rows"][0]["n"], 3);
+
+    // Without the app running, the show-in-app tools say so.
+    let r = c.request(
+        "tools/call",
+        json!({ "name": "open_table", "arguments": { "connection": "shop", "table": "users" } }),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r.to_string().contains("not open"), "{r}");
+
     let page = c.tool(
         "fetch_rows",
         json!({ "connection": "shop", "table": "users", "where": "age < 35", "sort": ["-age"], "pageSize": 10 }),

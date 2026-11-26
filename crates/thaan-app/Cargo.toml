@@ -32,4 +32,6 @@ serde_json.workspace = true
 # Local time for the MQTT console; already built as part of GPUI.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow.workspace = true
+# Hands `thaan mcp` requests (app_link.rs) to the UI thread; already in GPUI's tree.
+async-channel = "2.5"
 gpui-kit = { version = "0.11.0", features = ["tree-sitter-sql", "tree-sitter-javascript"] }
