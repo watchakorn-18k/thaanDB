@@ -60,7 +60,8 @@ impl Client {
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return Err("the broker URL starts with wss:// (or ws:// for a local broker)".into());
         }
-        let ws = WebSocket::new_with_str(url, "mqtt").map_err(|e| format!("{e:?}"))?;
+        let ws = WebSocket::new_with_str(url, "mqtt")
+            .map_err(|_| format!("`{url}` is not a WebSocket URL the browser accepts"))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
         let inbox = Rc::new(RefCell::new(Inbox::default()));
         let client_id = format!("thaan-web-{:x}", (js_sys::Math::random() * 1e12) as u64);
@@ -158,7 +159,13 @@ impl Client {
         send(&self.ws, &packet::subscribe(id, &[(filter, qos.min(1))]))
     }
 
-    pub fn publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> Result<(), String> {
+    pub fn publish(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+    ) -> Result<(), String> {
         if topic.is_empty() || topic.contains(['+', '#']) {
             return Err("a topic to publish to has no wildcards".into());
         }
@@ -201,7 +208,10 @@ fn handle(ws: &WebSocket, inbox: &mut Inbox, p: Incoming) {
     match p {
         Incoming::ConnAck { code: 0, .. } => inbox.connected = true,
         Incoming::ConnAck { code, .. } => {
-            inbox.error = Some(format!("the broker refused: {}", packet::connack_error(code)))
+            inbox.error = Some(format!(
+                "the broker refused: {}",
+                packet::connack_error(code)
+            ))
         }
         Incoming::Publish {
             topic,

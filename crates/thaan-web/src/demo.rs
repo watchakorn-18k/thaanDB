@@ -41,11 +41,27 @@ const FIRST: [&str; 16] = [
     "Ploy", "Wit", "Nok", "Ben", "Fah",
 ];
 const LAST: [&str; 12] = [
-    "Srisuk", "Wongsa", "Chaiyo", "Rattana", "Boonmee", "Saetang", "Lee", "Park", "Tan",
-    "Kaewmanee", "Suwan", "Thong",
+    "Srisuk",
+    "Wongsa",
+    "Chaiyo",
+    "Rattana",
+    "Boonmee",
+    "Saetang",
+    "Lee",
+    "Park",
+    "Tan",
+    "Kaewmanee",
+    "Suwan",
+    "Thong",
 ];
 const CITIES: [&str; 8] = [
-    "Bangkok", "Chiang Mai", "Khon Kaen", "Phuket", "Hat Yai", "Udon Thani", "Nakhon Ratchasima",
+    "Bangkok",
+    "Chiang Mai",
+    "Khon Kaen",
+    "Phuket",
+    "Hat Yai",
+    "Udon Thani",
+    "Nakhon Ratchasima",
     "Pattaya",
 ];
 const PRODUCTS: [(&str, &str, f64); 20] = [
@@ -77,7 +93,10 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self, n: usize) -> usize {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 33) % n as u64) as usize
     }
 }
@@ -95,7 +114,11 @@ fn data() -> String {
         sql.push_str(&format!(
             "insert into customers values ({id}, {}, {}, {}, '2025-{:02}-{:02}');\n",
             q(&format!("{f} {l}")),
-            q(&format!("{}.{}{id}@example.com", f.to_lowercase(), l.to_lowercase())),
+            q(&format!(
+                "{}.{}{id}@example.com",
+                f.to_lowercase(),
+                l.to_lowercase()
+            )),
             q(CITIES[r.next(CITIES.len())]),
             1 + r.next(12),
             1 + r.next(28),

@@ -39,6 +39,8 @@ mod docview {
 #[allow(dead_code)]
 #[path = "../../thaan-app/src/grid.rs"]
 mod grid;
+#[path = "../../thaan-app/src/logo.rs"]
+mod logo;
 #[allow(dead_code)]
 #[path = "../../thaan-app/src/theme.rs"]
 mod theme;
@@ -73,12 +75,25 @@ extern "C" {
     pub(crate) fn console_error(s: &str);
 }
 
+/// The page's folder as an absolute URL without the trailing slash
+/// (`https://user.github.io/thaanDB`): the asset loader needs absolute URLs.
+fn page_dir() -> String {
+    let base = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.base_uri().ok().flatten())
+        .unwrap_or_default();
+    match base.rfind('/') {
+        Some(i) => base[..i].to_string(),
+        None => base,
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     gpui_kit::platform::web_init();
     gpui_kit::platform::single_threaded_web()
-        // Icons are fetched from ./assets/icons next to the page (copied by build-web.sh).
-        .with_assets(gpui_kit::assets::Assets::new("."))
+        // Icons are fetched from assets/icons next to the page (copied by build-web.sh).
+        .with_assets(gpui_kit::assets::Assets::new(page_dir()))
         .run(|cx| {
             gpui_kit::init(cx);
             let fonts = FONTS.iter().map(|f| Cow::Borrowed(*f)).collect();

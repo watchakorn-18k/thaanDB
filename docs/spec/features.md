@@ -176,6 +176,14 @@ Written from the MQTT 3.1.1 OASIS standard. No other client's code was studied.
 | Publish from the grid | Adding a row publishes it (topic defaults to the open topic); deleting a retained row clears it (empty retained publish); messages cannot be edited | `table.applyChanges` | engine+gui |
 | Read-only | Refuses `PUBLISH` and grid writes | — | engine |
 
+## 9c. Browser demo
+
+Written from the WebAssembly, WebSocket and MQTT specs; see `docs/web-demo.md`.
+
+| Feature | Behaviour | CommandId | Status |
+| --- | --- | --- | --- |
+| Demo page | ThaanDB in a web page (GitHub Pages): a sample shop database (SQLite in memory) with its tables in the desktop grid, a SQL editor, an MQTT console over WebSocket, and a link to the desktop app. No servers over TCP, no MCP, no files | — | web (built, `crates/thaan-web`) |
+
 ## 10. Headless access
 
 | Feature | Behaviour | CommandId | Status |

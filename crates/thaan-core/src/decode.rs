@@ -54,12 +54,11 @@ impl Decoder {
     /// Whether this build can run the decoder (compression and pickle need the
     /// `decoders` feature).
     pub fn available(self) -> bool {
-        match self {
-            Decoder::Gzip | Decoder::Zlib | Decoder::Deflate | Decoder::Pickle => {
-                cfg!(feature = "decoders")
-            }
-            _ => true,
-        }
+        cfg!(feature = "decoders")
+            || !matches!(
+                self,
+                Decoder::Gzip | Decoder::Zlib | Decoder::Deflate | Decoder::Pickle
+            )
     }
 }
 

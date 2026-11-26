@@ -17,6 +17,7 @@ use thaan_core::schema::ObjectRef;
 use thaan_core::table::PageRequest;
 use thaan_core::ResultSet;
 
+const REPO: &str = "https://github.com/watchakorn-18k/thaanDB";
 const RELEASES: &str = "https://github.com/watchakorn-18k/thaanDB/releases/latest";
 const PAGE: u64 = 50;
 /// Messages kept in the MQTT list.
@@ -64,13 +65,21 @@ impl Demo {
         track_focus(&query_grid, cx);
         let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         editor.update(cx, |e, cx| e.set_value(crate::demo::STARTER, window, cx));
-        let input = |value: &str, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+        let input = |value: &str,
+                     placeholder: &'static str,
+                     window: &mut Window,
+                     cx: &mut Context<Self>| {
             let s = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
             let v = value.to_string();
             s.update(cx, |s, cx| s.set_value(v, window, cx));
             s
         };
-        let broker = input("wss://test.mosquitto.org:8081", "wss://broker:port", window, cx);
+        let broker = input(
+            "wss://test.mosquitto.org:8081",
+            "wss://broker:port",
+            window,
+            cx,
+        );
         let sub_filter = input("thaan/demo/#", "Topic filter", window, cx);
         let pub_topic = input("thaan/demo/hello", "Topic", window, cx);
         let pub_payload = input("{\"from\":\"ThaanDB web\"}", "Payload", window, cx);
@@ -305,7 +314,10 @@ impl Demo {
             return;
         };
         self.mqtt_note = Some(match c.publish(&topic, payload.as_bytes(), 0, false) {
-            Ok(()) => (format!("Published {} bytes to {topic}", payload.len()), false),
+            Ok(()) => (
+                format!("Published {} bytes to {topic}", payload.len()),
+                false,
+            ),
             Err(e) => (e, true),
         });
         cx.notify();
@@ -322,7 +334,18 @@ impl Demo {
             .gap_3()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("ThaanDB"))
+            // The desktop title bar's mark: header row in the accent, column in the text colour.
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(crate::logo::mark(theme.primary, theme.foreground))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("ThaanDB"),
+                    ),
+            )
             .child(
                 div()
                     .text_xs()
@@ -330,6 +353,16 @@ impl Demo {
                     .child("Browser demo · a sample shop database in your browser"),
             )
             .child(div().flex_1())
+            .child(
+                Button::new("repo")
+                    // The GitHub mark (Simple Icons, CC0; crates/thaan-web/icons/SOURCES.md).
+                    .icon(icon("brand-github"))
+                    .label("GitHub")
+                    .ghost()
+                    .small()
+                    .tooltip("Source code, issues and releases")
+                    .on_click(|_, _, cx| cx.open_url(REPO)),
+            )
             .child(
                 Button::new("get-app")
                     .icon(icon("download"))
@@ -553,36 +586,55 @@ impl Demo {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                v_flex().gap_1().child(label("Broker (MQTT over WebSocket)")).child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Input::new(&self.broker).small()))
-                        .child(
-                            Button::new("connect")
-                                .icon(icon(if self.client.is_some() { "unplug" } else { "plug" }))
-                                .label(if self.client.is_some() { "Disconnect" } else { "Connect" })
-                                .when(self.client.is_none(), |b| b.primary())
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_broker(cx))),
-                        ),
-                ),
+                v_flex()
+                    .gap_1()
+                    .child(label("Broker (MQTT over WebSocket)"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Input::new(&self.broker).small()))
+                            .child(
+                                Button::new("connect")
+                                    .icon(icon(if self.client.is_some() {
+                                        "unplug"
+                                    } else {
+                                        "plug"
+                                    }))
+                                    .label(if self.client.is_some() {
+                                        "Disconnect"
+                                    } else {
+                                        "Connect"
+                                    })
+                                    .when(self.client.is_none(), |b| b.primary())
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_broker(cx))),
+                            ),
+                    ),
             )
             .child(
                 h_flex()
                     .gap_3()
                     .child(
-                        v_flex().flex_1().gap_1().child(label("Subscribe to")).child(
-                            h_flex()
-                                .gap_2()
-                                .child(div().flex_1().child(Input::new(&self.sub_filter).small()))
-                                .child(
-                                    Button::new("sub")
-                                        .label("Subscribe")
-                                        .small()
-                                        .disabled(!connected)
-                                        .on_click(cx.listener(|this, _, _, cx| this.subscribe(cx))),
-                                ),
-                        ),
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(label("Subscribe to"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().child(Input::new(&self.sub_filter).small()),
+                                    )
+                                    .child(
+                                        Button::new("sub")
+                                            .label("Subscribe")
+                                            .small()
+                                            .disabled(!connected)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.subscribe(cx)),
+                                            ),
+                                    ),
+                            ),
                     )
                     .child(
                         v_flex().flex_1().gap_1().child(label("Publish")).child(
@@ -607,8 +659,9 @@ impl Demo {
                 .map(|c| if c.is_control() { ' ' } else { c })
                 .take(200)
                 .collect::<String>();
-            let secs = (m.at_ms / 1000.0) as i64;
-            let (h, mi, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+            // The browser's local time.
+            let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(m.at_ms));
+            let (h, mi, s) = (d.get_hours(), d.get_minutes(), d.get_seconds());
             h_flex()
                 .h(px(44.))
                 .px_3()
@@ -616,9 +669,17 @@ impl Demo {
                 .border_b_1()
                 .border_color(theme.border)
                 .child(
-                    icon(if m.sent { "arrow-up-right" } else { "arrow-down-left" })
-                        .size_3p5()
-                        .text_color(if m.sent { theme.primary } else { theme.muted_foreground }),
+                    icon(if m.sent {
+                        "arrow-up-right"
+                    } else {
+                        "arrow-down-left"
+                    })
+                    .size_3p5()
+                    .text_color(if m.sent {
+                        theme.primary
+                    } else {
+                        theme.muted_foreground
+                    }),
                 )
                 .child(
                     v_flex()
@@ -634,7 +695,7 @@ impl Demo {
                                         .font_family(theme.mono_font_family.clone())
                                         .text_color(theme.muted_foreground)
                                         .child(format!(
-                                            "{h:02}:{mi:02}:{s:02} UTC · QoS {}{} · {} B",
+                                            "{h:02}:{mi:02}:{s:02} · QoS {}{} · {} B",
                                             m.qos,
                                             if m.retain { " · retained" } else { "" },
                                             m.payload.len()

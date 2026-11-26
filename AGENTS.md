@@ -119,6 +119,7 @@ crates/
   thaan-cli/           `thaan` binary: headless access to every command; `thaan mcp`
                        is the MCP server (protocol in `thaan_core::mcp`)
   thaan-app/           GPUI desktop app (gpui-component widgets)
+  thaan-web/           browser demo for GitHub Pages (wasm, nightly; docs/web-demo.md)
 docs/
   clean-room.md        what sources are allowed
   spec/features.md     behaviour spec + CommandId + status per feature
@@ -137,6 +138,7 @@ cargo run -p thaan-cli -- query sqlite::memory: "select 1"
 cargo run -p thaan-cli -- mcp                   # MCP server on stdio (docs/mcp.md)
 cargo run -p thaan-app                         # desktop app
 scripts/dev-watch.sh                           # desktop app, rebuilt and restarted on save
+scripts/build-web.sh                           # browser demo into target/web (nightly)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```

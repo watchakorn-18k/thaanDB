@@ -50,6 +50,10 @@
 - The app icon and the title-bar mark come from `docs/brand` (see its README). Regenerate
   `AppIcon.icns` from `docs/brand/logo/thaandb-macos-icon*.svg` with `iconutil` if the logo changes.
 - Use `THAAN_HOME=target/thaan-home` for manual testing so the user's real store is untouched.
+- The browser demo (`crates/thaan-web`, `docs/web-demo.md`) builds with nightly Rust and
+  `scripts/build-web.sh`; it reuses `thaan-app/src/grid.rs` and `theme.rs` through `#[path]`,
+  so keep those two free of desktop-only calls (threads, files, the keychain). Check with
+  `cargo +nightly check -p thaan-web --target wasm32-unknown-unknown`.
 - `scripts/dev-watch.sh` rebuilds and restarts the app on every save (cargo-watch; `--bundle`
   relaunches `target/ThaanDB.app` for the screenshot tools). It is a restart, not hot reload:
   GPUI cannot swap code into a running app, so tabs and connections are lost each time.
@@ -196,7 +200,9 @@ Notes from using them:
   without a logo fall back to lucide `database`. Never take logos from another database client.
 - **Set (everything else):** lucide only (version 1.43, ISC licence in `gpui-kit-assets-0.11.0/LICENSE-LUCIDE`),
   shipped by `gpui-kit-assets`. Do not add other icon sets, emoji or other products' logos.
-  The exceptions are the ThaanDB logo (`logo.rs`, from `docs/brand`) and the database logos above.
+  The exceptions are the ThaanDB logo (`logo.rs`, from `docs/brand`), the database logos above,
+  and the GitHub mark on the browser demo's link to this repository
+  (`crates/thaan-web/icons/SOURCES.md`).
 - **How:** `icon("name")` in `app.rs` → `Icon::empty().path("icons/name.svg")`. The name is the
   lucide file name without `.svg`. Check that it exists:
   `ls ~/.cargo/registry/src/*/gpui-kit-assets-0.11.0/assets/icons/<name>.svg`.

@@ -7321,7 +7321,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
+ "js-sys",
  "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -7764,6 +7766,7 @@ dependencies = [
  "gpui-kit",
  "js-sys",
  "serde_json",
+ "sqlite-wasm-rs",
  "thaan-core",
  "thaan-driver-mqtt",
  "thaan-driver-sqlite",

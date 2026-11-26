@@ -1,0 +1,70 @@
+# Builds the browser demo (crates/thaan-web) and publishes it to GitHub Pages.
+# One-time setup: Settings > Pages > Build and deployment > Source: GitHub Actions.
+# See docs/web-demo.md.
+name: Web demo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/thaan-web/**"
+      - "crates/thaan-core/**"
+      - "crates/thaan-driver-sqlite/**"
+      - "crates/thaan-driver-mqtt/**"
+      - "crates/thaan-app/src/grid.rs"
+      - "crates/thaan-app/src/theme.rs"
+      - "Cargo.lock"
+      - "scripts/build-web.sh"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# One deployment at a time; a newer push replaces a build still running.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # GPUI's web scheduler (wasm_thread) needs nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: web
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # clang compiles SQLite for the browser (sqlite-wasm-rs); llvm brings llvm-ar.
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: wasm-bindgen-cli (the version in Cargo.lock)
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/,""); print; exit}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      - run: scripts/build-web.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/web
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
